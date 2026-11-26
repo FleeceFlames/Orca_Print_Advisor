@@ -153,7 +153,7 @@ The numbers inside **Mesh & Model Inspector** (dimensions, bed area, bottom fill
 
 ## Bugs, Feedback & Plugin Help
 
-Found a bug in the plugin, ran into a `.3mf` profile that didn't import properly, or need a hand with plugin setup? Feel free to leave a comment on Orca Cloud or open an issue on [GitHub Issues](https://github.com/FleeceFlames/Orca_makerworld_importer/issues) — just keep it related to the plugin itself. I check in whenever I have some free time and will gladly take a look!
+Found a bug in the plugin, hit a weird `.3mf` parsing issue, or have an idea for a new check? Feel free to leave a comment on [Orca Cloud](https://cloud.orcaslicer.com/p/3b308f5ef16a) or open an issue on [GitHub Issues](https://github.com/FleeceFlames/Orca_Print_Advisor/issues) — I check in whenever I have some free time and will gladly take a look!
 
 ---
 
