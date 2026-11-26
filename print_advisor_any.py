@@ -6,7 +6,7 @@
 # name = "Print Advisor"
 # description = "Beginner-friendly 3D print analyzer with selective, zero-risk setting recommendations."
 # author = "FleeceFlames"
-# version = "1.0.0"
+# version = "1.0.1"
 # ///
 
 """
@@ -19,8 +19,8 @@ Single-file universal plugin for OrcaSlicer 2.5+ (zero external dependencies, ze
 3. UnitHelper & ContextReader— Preserves '%' vs 'mm/s' units; merges .3mf over active presets.
 4. LivePlateAnalyzer         — Reads live 3D meshes & Variable Layer Height via orca.host.model().
 5. MeshAnalyzer              — Parses .3mf ZIP archives (streaming XML, VLH, modifiers, slice_info).
-6. RuleEngine                — Evaluates the 7 zero-risk rules, step-by-step manual guides & guardrails.
-7. Patchers                  — LivePlatePatcher (apply + revert) & ThreeMFPatcher (.3mf export).
+6. RuleEngine                — Evaluates the 8 zero-risk rules (incl. Smooth & Bridge Support), guides & guardrails.
+7. Patchers & Exporters      — LivePlatePatcher (apply + revert), LivePlateExporter & ThreeMFPatcher (.3mf export).
 8. APP_HTML (Pages UI)       — Dark-mode 2-tab HTML/CSS/JS frontend (Advisor | Learn & Safety).
 9. PrintAdvisorPage & Plugin — JS <-> Python message router, .3mf cache & preset-safe revert tracker.
 """
@@ -29,9 +29,11 @@ import base64
 import io
 import json
 import math
+import re
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import orca  # type: ignore
 
 
@@ -39,11 +41,8 @@ import orca  # type: ignore
 # 1. CONSTANTS & BASIC HELPERS
 # ============================================================================
 
-# 3MF uses a 4x3 affine matrix flattened to 12 floats (row-vector convention):
-#   (m00, m01, m02,   m10, m11, m12,   m20, m21, m22,   tx, ty, tz)
 IDENTITY_MAT = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
 
-# Multiplier to normalize any 3MF <model unit="..."> declaration into millimeters.
 UNIT_TO_MM = {
     "micron": 0.001,
     "millimeter": 1.0,
@@ -53,8 +52,6 @@ UNIT_TO_MM = {
     "meter": 1000.0,
 }
 
-# Settings read from active presets and .3mf project_settings.config.
-# Add any new OrcaSlicer key here first if you write a new rule later.
 WATCHED_KEYS = (
     "nozzle_diameter",
     "filament_type",
@@ -64,7 +61,12 @@ WATCHED_KEYS = (
     "spiral_mode",
     "wall_loops",
     "outer_wall_line_width",
+    "inner_wall_speed",
     "outer_wall_speed",
+    "default_acceleration",
+    "outer_wall_acceleration",
+    "machine_max_acceleration_x",
+    "machine_max_acceleration_y",
     "wall_sequence",
     "wall_generator",
     "ironing_type",
@@ -82,12 +84,18 @@ WATCHED_KEYS = (
     "initial_layer_infill_speed",
     "elefant_foot_compensation",
     "layer_height",
+    "seam_position",
     "seam_slope_type",
+    "seam_slope_conditional",
+    "seam_slope_steps",
     "enable_support",
     "support_type",
+    "support_style",
+    "support_on_build_plate_only",
+    "support_top_z_distance",
+    "support_interface_top_layers",
 )
 
-# Keys checked for per-object overrides so we warn when a part overrides a global fix.
 WATCHED_OVERRIDE_KEYS = {
     "wall_loops",
     "sparse_infill_pattern",
@@ -98,6 +106,12 @@ WATCHED_OVERRIDE_KEYS = {
     "enable_overhang_speed",
     "overhang_3_4_speed",
     "overhang_4_4_speed",
+    "outer_wall_speed",
+    "outer_wall_acceleration",
+    "seam_position",
+    "seam_slope_type",
+    "seam_slope_conditional",
+    "seam_slope_steps",
     "brim_type",
     "brim_width",
     "elefant_foot_compensation",
@@ -106,19 +120,38 @@ WATCHED_OVERRIDE_KEYS = {
     "layer_height",
     "initial_layer_speed",
     "initial_layer_infill_speed",
+    "enable_support",
+    "support_type",
+    "support_style",
+    "support_on_build_plate_only",
+    "support_top_z_distance",
+    "support_interface_top_layers",
 }
 
-# Native type hints used by LivePlatePatcher when calling PresetTransaction.set()
-BOOL_KEYS = {"enable_overhang_speed", "reduce_crossing_wall", "spiral_mode"}
-INT_KEYS = {"wall_loops"}
+BOOL_KEYS = {
+    "enable_overhang_speed",
+    "reduce_crossing_wall",
+    "spiral_mode",
+    "seam_slope_conditional",
+    "enable_support",
+    "support_on_build_plate_only",
+}
+INT_KEYS = {
+    "wall_loops",
+    "seam_slope_steps",
+    "support_interface_top_layers",
+}
 FLOAT_KEYS = {
     "layer_height",
     "brim_width",
     "elefant_foot_compensation",
+    "outer_wall_speed",
+    "outer_wall_acceleration",
     "overhang_3_4_speed",
     "overhang_4_4_speed",
     "initial_layer_speed",
     "initial_layer_infill_speed",
+    "support_top_z_distance",
 }
 
 
@@ -128,6 +161,14 @@ def clean_label(name):
         return ""
     s = str(name).strip()
     return s[2:].strip() if s.startswith("* ") else s
+
+
+def sanitize_filename_stem(name, fallback="active_plate"):
+    """Converts an object/plate title into a cross-platform safe filename stem."""
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name or ""))
+    safe = re.sub(r"\s+", "_", safe.strip())
+    safe = re.sub(r"_+", "_", safe).strip("._")
+    return safe or fallback
 
 
 def local_tag(tag):
@@ -146,6 +187,17 @@ def normalize_val(val):
     if isinstance(val, bool):
         return "1" if val else "0"
     return str(val).strip()
+
+
+def normalize_orca_json_value(val):
+    """Converts Python config values into OrcaSlicer's project_settings.config JSON format."""
+    if isinstance(val, bool):
+        return "1" if val else "0"
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, list):
+        return [normalize_orca_json_value(v) for v in val]
+    return val
 
 
 def safe_get(obj, name, default=None):
@@ -176,6 +228,11 @@ def parse_matrix(text, unit_scale=1.0):
         parts[6], parts[7], parts[8],
         parts[9] * unit_scale, parts[10] * unit_scale, parts[11] * unit_scale,
     )
+
+
+def format_matrix(m):
+    """Formats a 12-float row-vector affine tuple for a 3MF transform attribute."""
+    return " ".join(f"{v:.6f}" for v in m)
 
 
 def mat_mul(a, b):
@@ -280,7 +337,7 @@ def summarize_item_geometry(index, transformed_meshes, stride, has_vlh=False):
             mag = math.sqrt(nx * nx + ny * ny + nz * nz)
             if mag < 1e-9:
                 continue
-            area = 0.5 * mag * stride  # Scale by stride to preserve true mm^2 on sampled meshes
+            area = 0.5 * mag * stride
             nz_unit = nz / mag
             total_area += area
 
@@ -291,7 +348,6 @@ def summarize_item_geometry(index, transformed_meshes, stride, has_vlh=False):
             if z_avg_tri <= 5.0 and z_max_tri > 0.35:
                 bottom_5mm_total_area += area
 
-            # Base faces pointing upward indicate inside-out mesh normals
             if z_max_tri <= 0.35 and nz_unit >= 0.95:
                 upward_bed_area += area
                 continue
@@ -340,7 +396,7 @@ def summarize_item_geometry(index, transformed_meshes, stride, has_vlh=False):
 def build_mesh_report(
     item_summaries, source_unit, plate_count, total_triangles, sampled_triangles,
     skipped_modifiers, non_manifold_parts, per_object_overrides, any_inverted_normals,
-    slice_info, has_project_settings, project_settings,
+    slice_info, has_project_settings, project_settings, plate_stem="active_plate",
 ):
     """Aggregates per-item geometry metrics into the unified report format used by RuleEngine & UI."""
     fillet_needs_vlh = any(
@@ -349,6 +405,7 @@ def build_mesh_report(
     )
     return {
         "empty": False,
+        "plate_stem": plate_stem,
         "source_unit": source_unit,
         "object_count": len(item_summaries),
         "plate_count": plate_count,
@@ -360,6 +417,7 @@ def build_mesh_report(
         "inverted_normals": any_inverted_normals,
         "has_variable_layer_height": any(i["has_vlh"] for i in item_summaries),
         "fillet_needs_vlh": fillet_needs_vlh,
+        "supports_enabled": False,
         "max_size_mm": (
             max(i["size_mm"][0] for i in item_summaries),
             max(i["size_mm"][1] for i in item_summaries),
@@ -560,13 +618,13 @@ class LivePlateAnalyzer:
         item_summaries = []
         any_inverted_normals = False
         item_idx = 0
+        first_obj_name = ""
 
         for obj in objects:
             for k in (safe_get(obj, "config_keys", []) or []):
                 if k in WATCHED_OVERRIDE_KEYS:
                     per_object_overrides.add(k)
 
-            # Detect per-object Variable Layer Height directly from OrcaSlicer
             obj_has_vlh = bool(safe_get(obj, "has_custom_layering", False))
             obj_has_mesh_errors = int(safe_get(obj, "mesh_errors_count", 0) or 0) > 0
 
@@ -608,6 +666,9 @@ class LivePlateAnalyzer:
             if not printable_vols:
                 continue
 
+            if not first_obj_name:
+                first_obj_name = str(safe_get(obj, "name", "") or "")
+
             for inst in instances:
                 if safe_get(inst, "printable", True) is False:
                     continue
@@ -630,7 +691,7 @@ class LivePlateAnalyzer:
                     combined = mat_mul(vol_mat, inst_mat)
                     flip = -1.0 if mat_det(combined) < 0 else 1.0
                     sampled_tris = []
-                    t_verts = {}  # Lazy cache: only transform vertices used by sampled triangles
+                    t_verts = {}
                     for i in range(0, t_count, stride):
                         tri = mesh.triangle(i)
                         sampled_tris.append(tri)
@@ -655,7 +716,7 @@ class LivePlateAnalyzer:
         return build_mesh_report(
             item_summaries=item_summaries,
             source_unit="millimeter",
-            plate_count=None,  # orca.host.model() spans all plates in the active project
+            plate_count=None,
             total_triangles=total_triangles,
             sampled_triangles=sampled_triangles,
             skipped_modifiers=skipped_modifiers,
@@ -665,6 +726,7 @@ class LivePlateAnalyzer:
             slice_info={"has_slice_info": False, "time_sec": None, "weight_g": None},
             has_project_settings=True,
             project_settings=None,
+            plate_stem=sanitize_filename_stem(first_obj_name, fallback="active_plate"),
         )
 
 
@@ -689,11 +751,6 @@ class MeshAnalyzer:
         return self.zip_map.get(path.lstrip("/").lower())
 
     def _parse_layer_heights_profile(self):
-        """
-        Reads Metadata/layer_heights_profile.txt (OrcaSlicer / Bambu Studio format):
-          object_id=1|0.0,0.2,0.24,0.44,...
-        Returns the set of object IDs that contain a non-empty Variable Layer Height curve.
-        """
         vlh_ids = set()
         entry = self._find_entry("Metadata/layer_heights_profile.txt")
         if not entry:
@@ -719,7 +776,6 @@ class MeshAnalyzer:
         return vlh_ids
 
     def _parse_model_settings(self):
-        """Extracts non-printable modifier parts, per-object overrides, plate count, and XML VLH/height-range flags."""
         non_normal_parts = set()
         per_object_overrides = set()
         vlh_ids_xml = set()
@@ -986,13 +1042,182 @@ class MeshAnalyzer:
 class RuleEngine:
     """
     Evaluates zero-risk physics & intent rules ONLY when real 3D geometry is present.
-    - Auto-patchable tips touch ONLY safe process keys (never filament calibration or supports).
-    - Manual tips (`manual_only=True`) provide step-by-step instructions and auto-clear once
-      detected (e.g., Variable Layer Height) or when the user clicks 'Mark Done'.
+    - Auto-patchable tips touch ONLY safe process keys (never filament calibration).
+    - Opt-in fixes (`default_checked=False`, `manual_only=False`) let you enable optional
+      upgrades like Bridge Supports or Top Ironing directly via the Apply/Export button.
+    - Manual tips (`manual_only=True`) provide step-by-step instructions for UI-only tools
+      like Variable Layer Height and auto-clear once detected or marked done.
+    - Smooth Surface Finish (`smooth=True`) layers material-aware outer-skin pathing,
+      conditional scarf seams, and downward-clamped speed/accel caps across all OrcaSlicer filaments.
     """
 
     @staticmethod
-    def evaluate(context, mesh_metrics, intent="engineering", print_in_place=False):
+    def _get_smooth_policy(filament_type, filament_name=""):
+        ft = str(filament_type or "").upper().strip()
+        fn = str(filament_name or "").upper().strip()
+        combined = f"{ft} {fn}"
+
+        if any(k in ft for k in ("PVA", "BVOH")):
+            return {
+                "label": f"{ft} (Support Material)",
+                "outer_speed": 45.0,
+                "outer_accel": 2000.0,
+                "scarf_type": "none",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "Slot 0 is a soluble support filament — select your primary model filament in Slot 0 or slice normally; keep soluble spools bone-dry.",
+            }
+
+        if any(k in combined for k in ("TPU", "TPE", "FLEX", "85A", "90A", "95A")):
+            return {
+                "label": "TPU / Flexible",
+                "outer_speed": 35.0,
+                "outer_accel": 1500.0,
+                "scarf_type": "none",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "Set Overhang fan speed to 40–60% in Filament -> Cooling, keep infill/inner-wall speeds close to outer-wall speed for flat nozzle pressure, and dry TPU before printing.",
+            }
+
+        if "AERO" in combined or "LW-PLA" in combined or "LW-ASA" in combined:
+            return {
+                "label": f"{ft or 'LW-Aero'} (Foaming Lightweight)",
+                "outer_speed": 45.0,
+                "outer_accel": 2000.0,
+                "scarf_type": "none",
+                "is_cf": False,
+                "is_high_warp": "ASA" in combined,
+                "fan_advice": "Scarf seams are disabled because flow-ramping changes foaming density. Keep speeds steady across perimeters and set cooling per manufacturer foaming chart.",
+            }
+
+        if any(k in ft for k in ("PA-CF", "PA6-CF", "PA11-CF", "PA12-CF", "PAHT-CF", "PA-GF", "PA6-MF", "PAHT-GF", "PA-MF", "PC-CF", "PET-CF", "PET-GF")):
+            return {
+                "label": f"{ft} (Engineering Composite)",
+                "outer_speed": 55.0,
+                "outer_accel": 2500.0,
+                "scarf_type": "all",
+                "is_cf": True,
+                "is_high_warp": False,
+                "fan_advice": f"For {ft}: keep cooling low (0–15% regular, max 25–30% on steep overhangs), use a hardened nozzle (0.4–0.6mm), and dry thoroughly (80–100°C) to avoid rough moisture-foamed walls.",
+            }
+
+        if any(k in ft for k in ("-CF", "-GF", "-MF")) or any(k in fn for k in ("CARBON", "GLASS FIBER", "PETG-CF", "PLA-CF", "ABS-CF", "ASA-CF")):
+            is_abs_asa = ("ABS" in ft) or ("ASA" in ft)
+            fan_note = (
+                f"For {ft}: cap Overhang fan at 25–35% inside an enclosed chamber to prevent layer splitting, and use a hardened nozzle."
+                if is_abs_asa else
+                f"For {ft}: carbon/glass fibers naturally hide layer lines; set Overhang fan to 50–70%, use a hardened nozzle, and dry the spool so moisture doesn't roughen the matte finish."
+            )
+            return {
+                "label": f"{ft} (Fiber Composite)",
+                "outer_speed": 55.0,
+                "outer_accel": 2500.0,
+                "scarf_type": "all",
+                "is_cf": True,
+                "is_high_warp": is_abs_asa,
+                "fan_advice": fan_note,
+            }
+
+        if ft.startswith("PC") or "POLYCARBONATE" in fn:
+            return {
+                "label": f"{ft} (Polycarbonate)",
+                "outer_speed": 50.0,
+                "outer_accel": 2500.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": True,
+                "fan_advice": "For PC / PC-ABS: keep cooling minimal (0–15%, max 20% on bridges), preheat your chamber (55–65°C), and dry thoroughly to prevent micro-cracking and rough walls.",
+            }
+
+        if ft in ("PA", "PA6", "PA11", "PA12", "PAHT", "PA-S") or "NYLON" in fn:
+            return {
+                "label": f"{ft} (Nylon / Polyamide)",
+                "outer_speed": 45.0,
+                "outer_accel": 2000.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": True,
+                "fan_advice": "For unfilled Nylon: keep cooling near 0–20% inside a heated chamber and dry the spool before printing—even slight moisture makes Nylon hiss and turn rough.",
+            }
+
+        if any(k in ft for k in ("ABS", "ASA", "HIPS")):
+            return {
+                "label": f"{ft} (Enclosed High-Temp)",
+                "outer_speed": 55.0,
+                "outer_accel": 2500.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": True,
+                "fan_advice": f"For {ft}: keep Overhang fan capped at 25–35% (0–15% regular fan) inside a warm enclosure to prevent corner warping or layer delamination.",
+            }
+
+        if "PETG" in ft or "PCTG" in ft:
+            return {
+                "label": f"{ft}",
+                "outer_speed": 50.0,
+                "outer_accel": 2500.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": f"For {ft}: set Overhang fan speed to 60–80% (keep regular fan low at 15–30% for strength) and dry the spool first for uniform gloss and zero stringing.",
+            }
+
+        if ft == "PVB":
+            return {
+                "label": "PVB (IPA-Smoothable)",
+                "outer_speed": 60.0,
+                "outer_accel": 3000.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "For PVB: set Overhang fan to 80–100%. Bonus: printed PVB parts can be misted or vapor-smoothed with 90%+ Isopropyl Alcohol (IPA) for a glass-like finish.",
+            }
+
+        if any(k in fn for k in ("SILK", "GLOSS", "DUAL COLOR", "TRICOLOR", "RAINBOW")):
+            return {
+                "label": "Silk / Glossy PLA",
+                "outer_speed": 45.0,
+                "outer_accel": 2000.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "For Silk PLA: set Overhang fan to 100% and keep outer-wall speed steady at ~45 mm/s—printing too fast turns Silk PLA dull/matte and highlights seam bumps.",
+            }
+
+        if ft == "PHA" or any(k in fn for k in ("MATTE", "WOOD", "MARBLE", "STONE", "TERRACOTTA")):
+            return {
+                "label": "Matte / Filled PLA",
+                "outer_speed": 60.0,
+                "outer_accel": 3000.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "For Matte / Wood / Stone PLA: set Overhang fan to 80–100% in Filament -> Cooling (use a 0.6mm nozzle for wood/mineral fills to prevent partial clogs).",
+            }
+
+        if any(k in fn for k in ("PLA+", "PLA PLUS", "PLA PRO", "TOUGH PLA", "HYPER PLA", "RAPID PLA")):
+            return {
+                "label": "PLA+ / Tough PLA",
+                "outer_speed": 60.0,
+                "outer_accel": 3000.0,
+                "scarf_type": "all",
+                "is_cf": False,
+                "is_high_warp": False,
+                "fan_advice": "For PLA+ / Tough PLA: set Overhang fan speed to 80–100% in Filament -> Cooling to freeze curved overhangs and bottom chamfers cleanly.",
+            }
+
+        return {
+            "label": "PLA" if "PLA" in ft else f"{ft or 'Standard'} / PLA",
+            "outer_speed": 60.0,
+            "outer_accel": 3000.0,
+            "scarf_type": "all",
+            "is_cf": False,
+            "is_high_warp": False,
+            "fan_advice": "Set Overhang fan speed to 80–100% in Filament -> Cooling to freeze curved overhangs and bottom chamfers cleanly.",
+        }
+
+    @staticmethod
+    def evaluate(context, mesh_metrics, intent="engineering", print_in_place=False, smooth=False):
         if not mesh_metrics or mesh_metrics.get("empty"):
             return {"tips": [], "good": [], "guardrails": []}
 
@@ -1005,10 +1230,14 @@ class RuleEngine:
         nozzle = max(0.15, UnitHelper.to_float(s.get("nozzle_diameter", "0.4"), 0.4))
         layer_h = UnitHelper.to_float(s.get("layer_height", "0.2"), 0.2)
         filament_type = str(s.get("filament_type", "Unknown")).upper()
+        filament_name = context.get("active_meta", {}).get("filament", "")
         spiral_mode = s.get("spiral_mode", "0") == "1"
         outer_speed = max(20.0, UnitHelper.to_float(s.get("outer_wall_speed", "150"), 150.0))
+        wall_loops = int(round(UnitHelper.to_float(s.get("wall_loops", "2"), 2.0)))
+        supports_enabled = s.get("enable_support", "0") == "1"
+        support_type = s.get("support_type", "normal(auto)")
+        smooth_policy = RuleEngine._get_smooth_policy(filament_type, filament_name)
 
-        # --- Guardrail Banners ---
         if context.get("printer_mismatch"):
             pm = context["printer_mismatch"]
             guardrails.append(
@@ -1026,7 +1255,7 @@ class RuleEngine:
             )
         if spiral_mode:
             guardrails.append(
-                "Spiral Vase Mode is active — Wall Strength, Infill, Layer Height, and Wall Order rules are bypassed."
+                "Spiral Vase Mode is active — Wall Strength, Infill, Layer Height, Seam, and Wall Order rules are bypassed."
             )
         if (mesh_metrics.get("plate_count") or 1) > 1:
             guardrails.append(
@@ -1045,9 +1274,7 @@ class RuleEngine:
                 if hit else None
             )
 
-        # --------------------------------------------------------------------
-        # RULE 1: Steep Overhang & Bottom Fillet Guard (Priority 1)
-        # --------------------------------------------------------------------
+        # RULE 1: Steep Overhang & Bottom Fillet Guard
         has_bottom_fillet = bool(
             trusted_mesh and (
                 trusted_mesh["worst_bottom_fillet_pct"] >= 3.0
@@ -1060,6 +1287,7 @@ class RuleEngine:
                 or trusted_mesh["total_steep_mm2"] >= 50.0
             )
         )
+        has_bridges = bool(trusted_mesh and trusted_mesh.get("total_bridge_mm2", 0.0) >= 40.0)
 
         en_overhang = s.get("enable_overhang_speed", "1")
         wall_seq = s.get("wall_sequence", "inner wall/outer wall")
@@ -1074,8 +1302,10 @@ class RuleEngine:
                 r1_patches["enable_overhang_speed"] = "1"
                 r1_diffs.append({"label": "Slow down for overhangs", "before": "OFF", "after": "ON"})
             if not spiral_mode and wall_seq == "outer wall/inner wall":
-                r1_patches["wall_sequence"] = "inner wall/outer wall"
-                r1_diffs.append({"label": "Order of walls", "before": "Outer/Inner", "after": "Inner/Outer"})
+                target_seq = "inner-outer-inner wall" if (smooth and wall_loops >= 3) else "inner wall/outer wall"
+                after_lbl = "Inner/Outer/Inner" if target_seq == "inner-outer-inner wall" else "Inner/Outer"
+                r1_patches["wall_sequence"] = target_seq
+                r1_diffs.append({"label": "Order of walls", "before": "Outer/Inner", "after": after_lbl})
             if abs_ov4 > 15.5:
                 nv, b_s, a_s = UnitHelper.format_target(raw_ov4, 15.0, outer_speed, "mm/s")
                 r1_patches["overhang_4_4_speed"] = nv
@@ -1095,18 +1325,17 @@ class RuleEngine:
                     "default_checked": True, "manual_only": False,
                     "title": "Fix Steep Bottom Curves & Overhangs",
                     "detected": detected,
-                    "why": "Rounded bottom edges print mostly in mid-air. Slowing down gives hot plastic time to cool before curling up, and Inner/Outer wall order gives the outer edge a solid anchor.",
+                    "why": "Rounded bottom edges print mostly in mid-air. Slowing down gives hot plastic time to cool before curling up, and printing inner walls first gives the outer edge a solid anchor.",
                     "manual_path": "Speed -> Overhang speed  |  Quality -> Order of walls",
                     "diffs": r1_diffs, "patches": r1_patches,
                     "impact": {"time_pct": 3.5, "time_min": 0, "filament_pct": 0.0, "filament_g": 0.0, "label": "+2–5% time | +0g filament"},
                     "override_warning": override_note(r1_patches.keys()),
                 })
             else:
-                good.append(f"Overhang Speeds & Wall Order: Slowdown is active ({round(abs_ov3)} / {round(abs_ov4)} mm/s) with Inner/Outer wall order.")
+                good.append(f"Overhang Speeds & Wall Order: Slowdown is active ({round(abs_ov3)} / {round(abs_ov4)} mm/s) with inner walls printed first.")
         elif trusted_mesh:
             good.append("Overhang Geometry: No significant steep overhangs or bottom fillets detected.")
 
-        # Read-Only Step-by-Step Manual Guide for Bottom Fillets (Auto-clears when VLH is detected)
         if has_bottom_fillet and not spiral_mode:
             manual_actions = []
             manual_steps = []
@@ -1128,16 +1357,17 @@ class RuleEngine:
                 else:
                     good.append("Variable Layer Height: Custom layer height curve detected on curved bottom-fillet geometry.")
 
-            if "PLA" in filament_type or "PETG" in filament_type:
+            if ("PLA" in filament_type or "PETG" in filament_type or "PCTG" in filament_type) and not smooth_policy["is_cf"]:
                 raw_fan = s.get("overhang_fan_speed")
                 raw_thresh = s.get("overhang_fan_threshold")
                 fan_val = UnitHelper.to_float(raw_fan, 0.0) if raw_fan is not None else None
                 thresh_val = UnitHelper.to_float(raw_thresh, 50.0) if raw_thresh is not None else None
-                target_fan = "70–90%" if "PETG" in filament_type else "100%"
+                target_fan = "60–80%" if ("PETG" in filament_type or "PCTG" in filament_type) else "100%"
+                min_fan = 60.0 if ("PETG" in filament_type or "PCTG" in filament_type) else 75.0
 
                 needs_cooling_tweak = (
                     (fan_val is None)
-                    or (fan_val < 70.0)
+                    or (fan_val < min_fan)
                     or (thresh_val is not None and thresh_val >= 75.0)
                 )
                 if needs_cooling_tweak:
@@ -1170,9 +1400,54 @@ class RuleEngine:
                     "override_warning": None,
                 })
 
-        # --------------------------------------------------------------------
-        # RULE 2: Nozzle Collision Prevention — Grid -> Gyroid (Priority 1)
-        # --------------------------------------------------------------------
+        # RULE 1B: Floating Horizontal Bridges & Opt-In Support Fix (>85 deg)
+        if has_bridges and not spiral_mode:
+            bridge_mm2 = trusted_mesh["total_bridge_mm2"]
+            if supports_enabled:
+                good.append(
+                    f"Floating Bridges ({bridge_mm2} mm²): Support generation is active ('{support_type}') — verify contact coverage in Preview."
+                )
+            else:
+                if "PETG" in filament_type or "PCTG" in filament_type:
+                    top_z_val = "0.24"
+                    top_z_note = "0.24 mm (prevents PETG support welding)"
+                elif "TPU" in filament_type or "TPE" in filament_type:
+                    top_z_val = "0.25"
+                    top_z_note = "0.25 mm (clean flexible release)"
+                else:
+                    top_z_val = f"{max(0.16, round(layer_h, 2)):g}"
+                    top_z_note = f"{top_z_val} mm (~1 layer height)"
+
+                r1b_patches = {
+                    "enable_support": "1",
+                    "support_type": "tree(auto)",
+                    "support_style": "organic",
+                    "support_on_build_plate_only": "1",
+                    "support_top_z_distance": top_z_val,
+                    "support_interface_top_layers": "2",
+                }
+                pip_extra = (
+                    " Print-in-Place is ON — verify in Preview that build-plate-only supports stay clear of moving hinges."
+                    if print_in_place else ""
+                )
+                tips.append({
+                    "id": "bridge_support", "bucket": "safety", "priority": 1,
+                    "default_checked": False, "manual_only": False,
+                    "title": f"Enable Tree Supports for Floating Bridges ({bridge_mm2} mm²) (Opt-In)",
+                    "detected": f"Detected {bridge_mm2} mm² of horizontal floating bridge/ceiling area (>85°) with Supports currently OFF.{pip_extra}",
+                    "why": "Short straight gaps (<15 mm) anchored on both sides can often bridge cleanly without supports, but mid-air islands or wide ceilings will droop unless supported. Unchecked by default—tick this box if Preview shows unsupported mid-air ceilings.",
+                    "manual_path": "Support -> Enable support -> Tree (auto) / Organic (On build plate only)",
+                    "diffs": [
+                        {"label": "Enable support", "before": "OFF", "after": "ON (Tree auto · Organic)"},
+                        {"label": "Support placement", "before": "Default", "after": "On build plate only"},
+                        {"label": "Top Z distance & interface", "before": "Default", "after": f"{top_z_note} · 2 interface layers"},
+                    ],
+                    "patches": r1b_patches,
+                    "impact": {"time_pct": 12.0, "time_min": 0, "filament_pct": 8.0, "filament_g": 0.0, "label": "+8–20% time | +5–15% filament"},
+                    "override_warning": override_note(r1b_patches.keys()),
+                })
+
+        # RULE 2: Nozzle Collision Prevention — Grid -> Gyroid
         infill_pat = s.get("sparse_infill_pattern", "gyroid").lower()
         infill_dens = UnitHelper.to_float(s.get("sparse_infill_density", "15%"), 15.0)
         if not spiral_mode:
@@ -1193,10 +1468,7 @@ class RuleEngine:
             elif infill_dens > 0:
                 good.append(f"Infill Pattern: Using '{infill_pat}' ({int(infill_dens)}%) — avoids self-intersecting grid collisions.")
 
-        # --------------------------------------------------------------------
-        # RULE 3: Intent-Specific Recommendations (Priority 2 & 3)
-        # --------------------------------------------------------------------
-        wall_loops = int(round(UnitHelper.to_float(s.get("wall_loops", "2"), 2.0)))
+        # RULE 3: Intent-Specific Recommendations
         line_width = UnitHelper.to_absolute(s.get("outer_wall_line_width", ""), nozzle, default=nozzle * 1.05)
         if line_width <= 0.05:
             line_width = nozzle * 1.05
@@ -1242,22 +1514,17 @@ class RuleEngine:
                 else:
                     good.append(f"Figure Layer Detail: {layer_h:g}mm layer height is well suited for crisp visual detail.")
 
-                # Read-Only Step-by-Step Display Polish Tips (Scarf Seam & Tree Supports)
                 cur_scarf = s.get("seam_slope_type", "none").lower()
-                cur_sup_en = s.get("enable_support", "0")
-                cur_sup_type = s.get("support_type", "normal(auto)").lower()
-                needs_scarf = cur_scarf in ("none", "")
-                needs_tree = bool(
-                    (has_steep_overhang or (trusted_mesh and trusted_mesh["total_bridge_mm2"] >= 40.0))
-                    and (cur_sup_en == "0" or "tree" not in cur_sup_type)
-                )
+                cur_sup_type = support_type.lower()
+                needs_scarf = (cur_scarf in ("none", "")) and not (smooth and smooth_policy["scarf_type"] != "none")
+                needs_tree = bool(has_steep_overhang and not has_bridges and (not supports_enabled or "tree" not in cur_sup_type))
 
                 fig_manual = []
                 fig_steps = []
                 if needs_scarf:
                     fig_manual.append({"label": "Hide vertical Z-seams", "before": "Standard seam", "after": "Scarf joint seam (Contour)"})
                     fig_steps.append("Open Quality -> Seam -> set 'Scarf joint seam' to 'Contour' (best when your filament Flow Ratio is calibrated).")
-                else:
+                elif cur_scarf not in ("none", ""):
                     good.append(f"Display Seam Polish: Scarf joint seam ('{cur_scarf}') is already enabled.")
 
                 if needs_tree:
@@ -1344,11 +1611,9 @@ class RuleEngine:
                         "override_warning": override_note(r3e_patches.keys()),
                     })
 
-        # --------------------------------------------------------------------
-        # RULE 4: Tipping & ABS/ASA Warp Guard — Outer Brim (Priority 1)
-        # --------------------------------------------------------------------
+        # RULE 4: Tipping & High-Warp Polymer Guard — Outer Brim
         brim_type = s.get("brim_type", "auto_brim").lower()
-        is_warp_mat = ("ABS" in filament_type) or ("ASA" in filament_type)
+        is_warp_mat = bool(smooth_policy["is_high_warp"])
         is_tippy = False
         if trusted_mesh:
             tip_ratio, min_bed, max_z = trusted_mesh["worst_tipping_ratio"], trusted_mesh["min_bed_area_mm2"], trusted_mesh["max_size_mm"][2]
@@ -1382,31 +1647,28 @@ class RuleEngine:
             elif is_tippy or is_warp_mat:
                 good.append(f"Bed Adhesion: Brim is already set to '{brim_type}'.")
 
-        # --------------------------------------------------------------------
-        # RULE 5: PETG / TPU Stringing Guard (Priority 2)
-        # --------------------------------------------------------------------
-        if ("PETG" in filament_type) or ("TPU" in filament_type):
-            mat_name = "TPU" if "TPU" in filament_type else "PETG"
+        # RULE 5: PETG / PCTG / TPU Stringing Guard
+        if any(k in filament_type for k in ("PETG", "PCTG", "TPU", "TPE")):
+            mat_name = "TPU/TPE" if ("TPU" in filament_type or "TPE" in filament_type) else filament_type
             if s.get("reduce_crossing_wall", "0") == "0":
-                r5_patches = {"reduce_crossing_wall": "1"}
-                tips.append({
-                    "id": "stringing_guard", "bucket": "recommended", "priority": 2,
-                    "default_checked": True, "manual_only": False,
-                    "title": f"Reduce {mat_name} Stringing (Avoid Crossing Walls)",
-                    "detected": f"Primary filament is {filament_type}, and 'Avoid crossing walls' is OFF.",
-                    "why": f"{mat_name} tends to ooze fine hairs across open gaps. Routing travel inside the part keeps outer walls clean without changing retraction calibration.",
-                    "manual_path": "Quality -> Precision / Travel -> Avoid crossing walls",
-                    "diffs": [{"label": "Avoid crossing walls", "before": "OFF", "after": "ON"}],
-                    "patches": r5_patches,
-                    "impact": {"time_pct": 3.0, "time_min": 0, "filament_pct": 0.0, "filament_g": 0.0, "label": "+2–5% time | +0g filament"},
-                    "override_warning": override_note(r5_patches.keys()),
-                })
+                if not smooth:
+                    r5_patches = {"reduce_crossing_wall": "1"}
+                    tips.append({
+                        "id": "stringing_guard", "bucket": "recommended", "priority": 2,
+                        "default_checked": True, "manual_only": False,
+                        "title": f"Reduce {mat_name} Stringing (Avoid Crossing Walls)",
+                        "detected": f"Primary filament is {filament_type}, and 'Avoid crossing walls' is OFF.",
+                        "why": f"{mat_name} tends to ooze fine hairs across open gaps. Routing travel inside the part keeps outer walls clean without changing retraction calibration.",
+                        "manual_path": "Quality -> Precision / Travel -> Avoid crossing walls",
+                        "diffs": [{"label": "Avoid crossing walls", "before": "OFF", "after": "ON"}],
+                        "patches": r5_patches,
+                        "impact": {"time_pct": 3.0, "time_min": 0, "filament_pct": 0.0, "filament_g": 0.0, "label": "+2–5% time | +0g filament"},
+                        "override_warning": override_note(r5_patches.keys()),
+                    })
             else:
                 good.append(f"{mat_name} Stringing Guard: 'Avoid crossing walls' is already enabled.")
 
-        # --------------------------------------------------------------------
-        # RULE 6: First-Layer Bond — CoreXY-Safe (Priority 1)
-        # --------------------------------------------------------------------
+        # RULE 6: First-Layer Bond — CoreXY-Safe
         raw_fl_speed = s.get("initial_layer_speed", "50")
         raw_fl_infill = s.get("initial_layer_infill_speed", "105")
         abs_fl_speed = UnitHelper.to_absolute(raw_fl_speed, outer_speed, default=50.0)
@@ -1437,9 +1699,7 @@ class RuleEngine:
         else:
             good.append(f"First-Layer Bond: Layer 1 speeds ({round(abs_fl_speed)} / {round(abs_fl_infill)} mm/s) are in a safe range.")
 
-        # --------------------------------------------------------------------
-        # RULE 7: Print-in-Place Guard (Priority 1)
-        # --------------------------------------------------------------------
+        # RULE 7: Print-in-Place Guard
         if print_in_place:
             ef_comp = UnitHelper.to_float(s.get("elefant_foot_compensation", "0"), 0.0)
             r7_patches, r7_diffs = {}, []
@@ -1464,24 +1724,127 @@ class RuleEngine:
             else:
                 good.append("Print-in-Place Clearances: Brim is OFF and Elephant's Foot compensation is active.")
 
-        if trusted_mesh and trusted_mesh.get("total_bridge_mm2", 0.0) >= 40.0:
-            guardrails.append(
-                f"Floating horizontal bridges detected ({trusted_mesh['total_bridge_mm2']} mm²) — check the Preview tab to confirm whether supports are needed."
+        # RULE 8: Smooth Surface Finish Modifier (Cross-Profile, All Filaments)
+        if smooth:
+            r8_patches, r8_diffs = {}, []
+            inner_speed_ref = max(
+                20.0,
+                UnitHelper.to_absolute(s.get("inner_wall_speed", "200"), 200.0, zero_means_ref=True, default=200.0),
             )
+            raw_outer_speed = s.get("outer_wall_speed", "150")
+            abs_outer_speed = UnitHelper.to_absolute(raw_outer_speed, inner_speed_ref, zero_means_ref=True, default=150.0)
+            if abs_outer_speed > smooth_policy["outer_speed"] + 0.5:
+                nv, b_s, a_s = UnitHelper.format_target(raw_outer_speed, smooth_policy["outer_speed"], inner_speed_ref, "mm/s")
+                r8_patches["outer_wall_speed"] = nv
+                r8_diffs.append({"label": "Outer wall speed", "before": b_s, "after": a_s})
+
+            def_accel = UnitHelper.to_float(s.get("default_acceleration", "0"), 0.0)
+            mach_accel_x = UnitHelper.to_float(s.get("machine_max_acceleration_x", "0"), 0.0)
+            mach_accel_y = UnitHelper.to_float(s.get("machine_max_acceleration_y", "0"), 0.0)
+            mach_limits = [a for a in (mach_accel_x, mach_accel_y) if a > 0.0]
+            baseline_accel = def_accel if def_accel > 0.0 else (min(mach_limits) if mach_limits else 5000.0)
+
+            raw_outer_accel = s.get("outer_wall_acceleration", "0")
+            abs_outer_accel = UnitHelper.to_absolute(raw_outer_accel, baseline_accel, zero_means_ref=True, default=baseline_accel)
+            if abs_outer_accel > smooth_policy["outer_accel"] + 5.0:
+                nv, b_s, a_s = UnitHelper.format_target(raw_outer_accel, smooth_policy["outer_accel"], baseline_accel, "mm/s²")
+                r8_patches["outer_wall_acceleration"] = nv
+                r8_diffs.append({"label": "Outer wall acceleration", "before": b_s, "after": a_s})
+
+            if not spiral_mode:
+                target_seq = "inner-outer-inner wall" if wall_loops >= 3 else "inner wall/outer wall"
+                if wall_seq != target_seq:
+                    r8_patches["wall_sequence"] = target_seq
+                    seq_lbl = "Inner/Outer/Inner" if target_seq == "inner-outer-inner wall" else "Inner/Outer"
+                    r8_diffs.append({"label": "Order of walls", "before": wall_seq, "after": seq_lbl})
+
+                cur_seam_pos = s.get("seam_position", "aligned").lower()
+                if cur_seam_pos != "aligned":
+                    r8_patches["seam_position"] = "aligned"
+                    r8_diffs.append({"label": "Seam position", "before": cur_seam_pos, "after": "Aligned"})
+
+                cur_scarf = s.get("seam_slope_type", "none").lower()
+                if smooth_policy["scarf_type"] == "none":
+                    if cur_scarf not in ("none", ""):
+                        r8_patches["seam_slope_type"] = "none"
+                        r8_diffs.append({"label": "Scarf joint seam", "before": cur_scarf, "after": "None (material flow safety)"})
+                else:
+                    if cur_scarf in ("none", ""):
+                        r8_patches["seam_slope_type"] = "all"
+                        r8_diffs.append({"label": "Scarf joint seam", "before": "None", "after": "Contour and hole"})
+                    if s.get("seam_slope_conditional", "0") != "1":
+                        r8_patches["seam_slope_conditional"] = "1"
+                        r8_diffs.append({"label": "Conditional scarf joint", "before": "OFF", "after": "ON (keeps sharp corners crisp)"})
+                    cur_steps = int(round(UnitHelper.to_float(s.get("seam_slope_steps", "10"), 10.0)))
+                    if cur_steps < 16:
+                        r8_patches["seam_slope_steps"] = "16"
+                        r8_diffs.append({"label": "Scarf steps", "before": str(cur_steps), "after": "16"})
+
+                if s.get("reduce_crossing_wall", "0") == "0":
+                    r8_patches["reduce_crossing_wall"] = "1"
+                    r8_diffs.append({"label": "Avoid crossing walls", "before": "OFF", "after": "ON"})
+
+            if r8_patches:
+                tips.append({
+                    "id": "smooth_finish", "bucket": "recommended", "priority": 2,
+                    "default_checked": True, "manual_only": False,
+                    "tag": "Smooth",
+                    "title": f"Smooth Surface Finish ({smooth_policy['label']} Polish)",
+                    "detected": f"Smooth mode is ON for {smooth_policy['label']} — optimizes outer-wall sheen, corner ringing, seam blending, and travel paths without altering your structural walls/infill.",
+                    "why": "Steady outer-wall speed and moderate acceleration eliminate glossy/matte banding and corner ringing, while Inner/Outer/Inner wall order and conditional scarf seams blend curved perimeters cleanly.",
+                    "manual_path": "Speed -> Outer wall  |  Quality -> Walls / Seam / Precision",
+                    "diffs": r8_diffs,
+                    "patches": r8_patches,
+                    "impact": {"time_pct": 8.0, "time_min": 0, "filament_pct": 0.0, "filament_g": 0.0, "label": "+5–12% time | +0g filament"},
+                    "override_warning": override_note(r8_patches.keys()),
+                })
+            else:
+                good.append(f"Smooth Surface Finish ({smooth_policy['label']}): Outer wall speeds, wall order, and seam settings are already tuned.")
+
+            smooth_manual_diffs = [
+                {"label": "1. Filament Moisture", "before": "Damp / air-exposed spool", "after": "Dried spool (prevents micro-pits & stringing)"},
+                {"label": "2. Extrusion Calibration", "before": "Default profile", "after": "Flow Ratio & Pressure Advance tuned"},
+                {"label": f"3. {smooth_policy['label']} Setup", "before": "Filament / Hardware", "after": "Cooling & nozzle matched to material"},
+            ]
+            smooth_manual_steps = [
+                "Dry hygroscopic filament (PETG, PA/Nylon, PC, TPU, ABS/ASA, CF/GF composites, or older PLA) before printing — moisture boils in the nozzle and causes rough walls no slicer setting can fix.",
+                "Run OrcaSlicer's Calibration -> Flow Rate and Pressure Advance tests once per filament brand; accurate flow is essential so scarf seams blend invisibly.",
+                smooth_policy["fan_advice"],
+            ]
+            if not spiral_mode and layer_h > 0.14 and not (trusted_mesh and trusted_mesh.get("has_variable_layer_height", False)):
+                smooth_manual_diffs.append({
+                    "label": "4. Curved Tops / Bevels",
+                    "before": f"Fixed {layer_h:g} mm",
+                    "after": "Variable Layer Height (Adaptive + Smooth)",
+                })
+                smooth_manual_steps.append(
+                    "For rounded tops or shallow angled chamfers, select the model and click 'Variable Layer Height' -> 'Adaptive' -> 'Smooth' in the top toolbar."
+                )
+
+            tips.append({
+                "id": "smooth_manual_guide", "bucket": "recommended", "priority": 3,
+                "default_checked": False, "manual_only": True,
+                "tag": "Smooth",
+                "title": f"Smooth Finish Checklist & Filament Setup ({smooth_policy['label']})",
+                "detected": "Slicer toolpaths alone cannot hide wet filament or uncalibrated flow — verify these hardware & filament basics for flawless surfaces.",
+                "why": "Even 3–5% over-extrusion or absorbed moisture creates seam ridges and surface roughness. Checking spool dryness, Flow Ratio, and material-specific cooling/nozzle rules locks in near-injection-molded results.",
+                "manual_path": "Filament -> Cooling  |  Top Toolbar -> Calibration & Variable Layer Height",
+                "diffs": smooth_manual_diffs,
+                "manual_steps": smooth_manual_steps,
+                "patches": {},
+                "impact": {"time_pct": 0.0, "time_min": 0, "filament_pct": 0.0, "filament_g": 0.0, "label": "Learn & filament checklist"},
+                "override_warning": None,
+            })
 
         return {"tips": tips, "good": good, "guardrails": guardrails}
 
 
 # ============================================================================
-# 7. PATCHERS (SAFE LIVE PROCESS APPLY/REVERT + NON-DESTRUCTIVE .3MF EXPORT)
+# 7. PATCHERS & EXPORTERS (LIVE APPLY/REVERT + LIVE & .3MF EXPORT)
 # ============================================================================
 
 class LivePlatePatcher:
-    """
-    Applies (or reverts) zero-risk process settings on the active OrcaSlicer process preset
-    via orca.host.preset.process.begin_update(). Edits stay unsaved in memory so saved
-    system/user profiles on disk are never overwritten.
-    """
+    """Applies (or reverts) zero-risk process settings on the active OrcaSlicer process preset."""
 
     @staticmethod
     def coerce_native(key, val):
@@ -1520,8 +1883,195 @@ class LivePlatePatcher:
         }
 
 
+class LivePlateExporter:
+    """Exports the active OrcaSlicer plate geometry + applied preset settings as a clean .3mf archive."""
+
+    CONTENT_TYPES_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+        '<Default Extension="config" ContentType="text/plain"/>'
+        '</Types>'
+    )
+
+    RELS_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Target="/3D/3dmodel.model" Id="rel-1" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+        '</Relationships>'
+    )
+
+    @staticmethod
+    def export(applied_keys):
+        model = orca.host.model()
+        if model is None:
+            raise ValueError("No active project is open in OrcaSlicer.")
+
+        objects = safe_get(model, "objects", []) or []
+        if not objects:
+            raise ValueError("Active OrcaSlicer plate is empty.")
+
+        next_id = 1
+        object_blocks = []
+        build_items = []
+        model_settings_objects = []
+        plate_instances_xml = []
+        first_obj_name = ""
+
+        for obj in objects:
+            volumes = safe_get(obj, "volumes", []) or []
+            instances = safe_get(obj, "instances", []) or []
+            if not volumes or not instances:
+                continue
+
+            printable_vols = []
+            for vol in volumes:
+                if not LivePlateAnalyzer._is_printable_volume(vol):
+                    continue
+                mesh = safe_get(vol, "mesh", None)
+                if mesh is None or safe_get(mesh, "is_empty", False):
+                    continue
+                t_count = int(safe_get(mesh, "triangle_count", 0) or 0)
+                v_count = int(safe_get(mesh, "vertex_count", 0) or 0)
+                if t_count <= 0 or v_count <= 0:
+                    continue
+                vol_mat = build_trs_matrix(
+                    safe_get(vol, "offset", None),
+                    safe_get(vol, "rotation", None),
+                    safe_get(vol, "scaling_factor", None),
+                    safe_get(vol, "mirror", None),
+                )
+                vol_name = str(safe_get(vol, "name", "") or "Part")
+                printable_vols.append((mesh, v_count, t_count, vol_mat, vol_name))
+
+            printable_insts = [inst for inst in instances if safe_get(inst, "printable", True) is not False]
+            if not printable_vols or not printable_insts:
+                continue
+
+            obj_name = str(safe_get(obj, "name", "") or f"Object_{next_id}")
+            if not first_obj_name:
+                first_obj_name = obj_name
+
+            comp_lines = []
+            part_settings_lines = []
+            for mesh, v_count, t_count, vol_mat, vol_name in printable_vols:
+                vol_oid = next_id
+                next_id += 1
+
+                verts_xml = "".join(
+                    f'<vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>'
+                    for v in (mesh.vertex(i) for i in range(v_count))
+                )
+                tris_xml = "".join(
+                    f'<triangle v1="{t[0]}" v2="{t[1]}" v3="{t[2]}"/>'
+                    for t in (mesh.triangle(i) for i in range(t_count))
+                )
+                object_blocks.append(
+                    f'<object id="{vol_oid}" type="model"><mesh>'
+                    f'<vertices>{verts_xml}</vertices>'
+                    f'<triangles>{tris_xml}</triangles>'
+                    f'</mesh></object>'
+                )
+                comp_lines.append(f'<component objectid="{vol_oid}" transform="{format_matrix(vol_mat)}"/>')
+                part_settings_lines.append(
+                    f'    <part id="{vol_oid}" subtype="normal_part">'
+                    f'<metadata key="name" value="{xml_escape(vol_name)}"/>'
+                    f'</part>'
+                )
+
+            asm_oid = next_id
+            next_id += 1
+            object_blocks.append(
+                f'<object id="{asm_oid}" type="model"><components>{"".join(comp_lines)}</components></object>'
+            )
+            model_settings_objects.append(
+                f'  <object id="{asm_oid}">\n'
+                f'    <metadata key="name" value="{xml_escape(obj_name)}"/>\n'
+                + "\n".join(part_settings_lines)
+                + "\n  </object>"
+            )
+
+            for inst_idx, inst in enumerate(printable_insts):
+                inst_mat = build_trs_matrix(
+                    safe_get(inst, "offset", None),
+                    safe_get(inst, "rotation", None),
+                    safe_get(inst, "scaling_factor", None),
+                    safe_get(inst, "mirror", None),
+                )
+                build_items.append(f'<item objectid="{asm_oid}" transform="{format_matrix(inst_mat)}" printable="1"/>')
+                plate_instances_xml.append(
+                    f'    <model_instance><metadata key="object_id" value="{asm_oid}"/>'
+                    f'<metadata key="instance_id" value="{inst_idx}"/></model_instance>\n'
+                )
+
+        if not build_items:
+            raise ValueError("No printable 3D geometry found on the active plate.")
+
+        model_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+            '  <metadata name="Application">OrcaSlicer</metadata>\n'
+            f'  <resources>\n{"".join(object_blocks)}\n  </resources>\n'
+            f'  <build>\n{"".join(build_items)}\n  </build>\n'
+            '</model>\n'
+        )
+
+        model_settings_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<config>\n'
+            + "\n".join(model_settings_objects)
+            + '\n  <plate>\n    <metadata key="plater_id" value="1"/>\n'
+            + "".join(plate_instances_xml)
+            + '  </plate>\n</config>\n'
+        )
+
+        bundle = orca.host.preset_bundle()
+        cfg = {}
+        for k in bundle.full_config_keys():
+            try:
+                val = bundle.full_config_value(k)
+                if val is not None:
+                    cfg[k] = normalize_orca_json_value(val)
+            except Exception:
+                pass
+
+        filament_names = [clean_label(f) for f in (bundle.current_filament_preset_names() or [])]
+        printer_preset = bundle.current_printer_preset()
+        process_preset = bundle.current_process_preset()
+        if printer_preset and "printer_settings_id" not in cfg:
+            cfg["printer_settings_id"] = clean_label(printer_preset.label())
+        if process_preset and "print_settings_id" not in cfg:
+            cfg["print_settings_id"] = clean_label(process_preset.label())
+        if filament_names and "filament_settings_id" not in cfg:
+            cfg["filament_settings_id"] = filament_names
+
+        diff_slots = cfg.get("different_settings_to_system")
+        if not isinstance(diff_slots, list) or not diff_slots:
+            diff_slots = [""] * (1 + max(1, len(filament_names)) + 1)
+
+        existing_proc_diffs = [k for k in str(diff_slots[0]).split(";") if k]
+        for k in applied_keys:
+            if k not in existing_proc_diffs:
+                existing_proc_diffs.append(k)
+        diff_slots[0] = ";".join(existing_proc_diffs)
+        cfg["different_settings_to_system"] = diff_slots
+
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            zout.writestr("[Content_Types].xml", LivePlateExporter.CONTENT_TYPES_XML.encode("utf-8"))
+            zout.writestr("_rels/.rels", LivePlateExporter.RELS_XML.encode("utf-8"))
+            zout.writestr("3D/3dmodel.model", model_xml.encode("utf-8"))
+            zout.writestr("Metadata/model_settings.config", model_settings_xml.encode("utf-8"))
+            zout.writestr("Metadata/project_settings.config", json.dumps(cfg, indent=4, ensure_ascii=False).encode("utf-8"))
+
+        stem = sanitize_filename_stem(first_obj_name, fallback="active_plate")
+        return f"{stem}_advised.3mf", out_buf.getvalue(), len(applied_keys)
+
+
 class ThreeMFPatcher:
-    """Patches ONLY selected process keys into a copy of the .3mf and strips stale G-code caches."""
+    """Patches ONLY selected process keys into a copy of a loaded .3mf and strips stale G-code caches."""
 
     @staticmethod
     def _is_stale_slice_cache(filename):
@@ -1548,12 +2098,18 @@ class ThreeMFPatcher:
                 else:
                     cfg[key] = val
 
-            if isinstance(cfg.get("different_settings_to_system"), list) and cfg["different_settings_to_system"]:
-                existing = [k for k in str(cfg["different_settings_to_system"][0]).split(";") if k]
-                for key in ordered_patches:
-                    if key not in existing:
-                        existing.append(key)
-                cfg["different_settings_to_system"][0] = ";".join(existing)
+            diff_slots = cfg.get("different_settings_to_system")
+            if not isinstance(diff_slots, list) or not diff_slots:
+                fil_ids = cfg.get("filament_settings_id")
+                fil_count = len(fil_ids) if isinstance(fil_ids, list) and fil_ids else 1
+                diff_slots = [""] * (1 + fil_count + 1)
+
+            existing = [k for k in str(diff_slots[0]).split(";") if k]
+            for key in ordered_patches:
+                if key not in existing:
+                    existing.append(key)
+            diff_slots[0] = ";".join(existing)
+            cfg["different_settings_to_system"] = diff_slots
 
             patched_bytes = json.dumps(cfg, indent=4, ensure_ascii=False).encode("utf-8")
             with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
@@ -1585,7 +2141,8 @@ APP_HTML = """<!DOCTYPE html>
     --bg:#1e2227; --panel:#282d35; --panel-dark:#21262d; --border:#3a414d;
     --text:#e6edf3; --muted:#9da7b3; --teal:#2dd4bf; --teal-bg:#1b3636;
     --amber:#fbbf24; --amber-bg:#3b2f1a; --green:#4ade80; --green-bg:#1a3327;
-    --blue:#60a5fa; --blue-bg:#1d2d44; --danger:#f87171;
+    --blue:#60a5fa; --blue-bg:#1d2d44; --purple:#c084fc; --purple-bg:#2e1f3d;
+    --danger:#f87171;
   }
   * { box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px 24px 40px; line-height:1.45; }
@@ -1636,6 +2193,7 @@ APP_HTML = """<!DOCTYPE html>
   .slider:before { position:absolute; content:""; height:16px; width:16px; left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.2s; }
   input:checked + .slider { background:var(--teal); }
   input:checked + .slider:before { transform:translateX(20px); }
+  input:checked + .slider.smooth-slider { background:var(--purple); }
   .mode-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; background:#1b2c2e; border:1px solid #2b5452; border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:12px; }
   .mode-bar.live-plate { background:#1c2633; border-color:#3b5575; }
   .mode-bar.empty-plate { background:#2b271c; border-color:#6b5424; }
@@ -1650,6 +2208,7 @@ APP_HTML = """<!DOCTYPE html>
   .badge.amber { background:var(--amber-bg); color:var(--amber); }
   .badge.green { background:var(--green-bg); color:var(--green); }
   .badge.blue { background:var(--blue-bg); color:var(--blue); }
+  .badge.purple { background:var(--purple-bg); color:var(--purple); }
   .guardrail-box { background:#2b271c; border:1px solid #6b5424; color:#fde68a; border-radius:7px; padding:9px 12px; font-size:12px; margin-top:10px; }
   .guardrail-box div + div { margin-top:5px; }
   .impact-bar { background:#1b282b; border:1px solid #2b5452; border-radius:8px; padding:12px 14px; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
@@ -1662,12 +2221,15 @@ APP_HTML = """<!DOCTYPE html>
   .tip-card { background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--teal); border-radius:8px; padding:13px 15px; margin-bottom:10px; }
   .tip-card.safety { border-left-color:var(--amber); }
   .tip-card.manual { border-left-color:var(--blue); }
+  .tip-card.smooth-card { border-left-color:var(--purple); }
   .tip-card.unchecked { opacity:0.68; }
   .tip-top { display:flex; align-items:flex-start; gap:10px; }
   .tip-top input[type="checkbox"] { width:17px; height:17px; margin-top:2px; accent-color:var(--teal); cursor:pointer; }
   .manual-tag { font-size:10px; font-weight:700; padding:3px 6px; border-radius:4px; background:var(--blue-bg); color:var(--blue); text-transform:uppercase; margin-top:2px; white-space:nowrap; }
+  .smooth-tag { font-size:10px; font-weight:700; padding:2px 7px; border-radius:4px; background:var(--purple-bg); color:var(--purple); text-transform:uppercase; letter-spacing:0.4px; }
   .tip-body { flex:1; }
   .tip-title-row { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; }
+  .tip-title-group { display:flex; align-items:center; flex-wrap:wrap; gap:7px; }
   .tip-title { font-weight:700; font-size:14px; }
   .impact-pill { font-size:11px; font-weight:600; background:var(--panel-dark); border:1px solid var(--border); border-radius:12px; padding:2px 8px; color:#c9d1d9; }
   .tip-detected { font-size:12px; color:#cbd5e1; margin:4px 0 8px; }
@@ -1731,14 +2293,14 @@ APP_HTML = """<!DOCTYPE html>
   .items-table th { color:var(--muted); font-size:11px; text-transform:uppercase; }
   .items-table tr:last-child td { border-bottom:none; }
   .footer-bar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin:16px 0; padding-top:14px; border-top:1px solid var(--border); }
-  #statusMsg { font-size:12px; color:var(--muted); max-width:520px; }
+  #statusMsg { font-size:12px; color:var(--muted); max-width:420px; }
   #statusMsg.ok { color:var(--green); }
   #statusMsg.err { color:var(--danger); }
   .learn-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   .learn-box { background:var(--panel-dark); border:1px solid #303640; border-radius:8px; padding:12px 14px; }
   .learn-box h3 { margin:0 0 8px; font-size:14px; }
-  .learn-box ul { margin:0 0 0 18px; padding:0; font-size:12px; color:#cbd5e1; }
-  .learn-box li { margin-bottom:5px; }
+  .learn-box ul, .learn-box ol { margin:0 0 0 18px; padding:0; font-size:12px; color:#cbd5e1; }
+  .learn-box li { margin-bottom:6px; }
   .rule-ref { margin-bottom:10px; padding-bottom:10px; border-bottom:1px solid #303640; font-size:12px; }
   .rule-ref:last-child { border-bottom:none; margin-bottom:0; padding-bottom:0; }
   .rule-ref strong { color:var(--teal); font-size:13px; display:block; margin-bottom:2px; }
@@ -1826,6 +2388,22 @@ APP_HTML = """<!DOCTYPE html>
           <span class="slider"></span>
         </label>
       </div>
+
+      <div class="toggle-row">
+        <div>
+          <div style="display:flex;align-items:center;gap:7px;">
+            <strong style="font-size:13px;">Smooth Surface Finish (Cosmetic Polish)</strong>
+            <span class="smooth-tag">All Filaments</span>
+          </div>
+          <div style="font-size:11px;color:var(--muted);">
+            Adapts outer-wall speed/acceleration, Inner/Outer/Inner wall order, conditional scarf seams, and travel routing to your active filament (PLA, PLA+, Silk, Matte, PETG, CF/GF, ABS/ASA, PC, PA, TPU, Aero, PVB) without changing structural walls or infill.
+          </div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="smoothToggle" onchange="onSmoothToggle()" />
+          <span class="slider smooth-slider"></span>
+        </label>
+      </div>
     </div>
 
     <div id="resultsWrap" class="hidden">
@@ -1842,7 +2420,6 @@ APP_HTML = """<!DOCTYPE html>
         <div class="impact-bar" id="impactBar"></div>
         <div id="tipsContainer"></div>
 
-        <!-- Applied Fixes collapsible + 1-Click Revert (Live Plate mode, right above Already Good) -->
         <details class="applied-box hidden" id="appliedBox">
           <summary id="appliedSummary">Applied to Active Plate (0)</summary>
           <ul id="appliedList"></ul>
@@ -1861,6 +2438,8 @@ APP_HTML = """<!DOCTYPE html>
           <div id="statusMsg">Ready.</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <button class="btn btn-secondary" onclick="copySummary()">Copy Summary</button>
+            <button class="btn btn-secondary hidden" id="downloadReportBtn" onclick="downloadReportTxt()" disabled>Download Report.txt</button>
+            <button class="btn btn-secondary hidden" id="downloadLive3mfBtn" onclick="exportLive3mf()" disabled>Download Optimized .3mf</button>
             <button class="btn" id="primaryActionBtn" onclick="applyOrExport()">Apply Selected</button>
           </div>
         </div>
@@ -1902,20 +2481,53 @@ APP_HTML = """<!DOCTYPE html>
           <h3 style="color:var(--green);">What Print Advisor WILL Patch</h3>
           <ul>
             <li>Slowing down steep overhangs &amp; bottom fillets + Inner/Outer wall order.</li>
+            <li>Opt-in breakaway <strong>Tree (Organic)</strong> supports for floating bridges (`&gt;85°`) with material-tuned Top Z distance.</li>
             <li>Switching from self-intersecting <strong>Grid</strong> infill to <strong>Gyroid</strong>.</li>
             <li>Intent upgrades: ~1.2mm+ walls (Engineering), finer layers (Figures), Arachne walls (Signs), or opt-in draft trims (Prototypes).</li>
-            <li>Outer brims for tall/narrow parts or ABS/ASA warp protection (unless Print-in-Place is ON).</li>
-            <li>PETG / TPU <strong>Avoid crossing walls</strong> and safe Layer 1 extrusion speeds.</li>
-            <li>Live-plate edits stay unsaved in memory and include <strong>1-Click Revert</strong>.</li>
+            <li><strong>Smooth Surface Finish</strong> toggle: material-aware outer wall speed/acceleration caps, Inner/Outer/Inner wall order, conditional scarf seams (disabled on TPU &amp; foaming Aero filaments), and travel routing.</li>
+            <li>Outer brims for tall/narrow parts or high-shrinkage polymers (ABS, ASA, PC, Nylon) unless Print-in-Place is ON.</li>
+            <li>Live-plate edits stay unsaved in memory with <strong>1-Click Revert</strong>, and unlock <strong>Download Optimized .3mf</strong> + <strong>Download Report.txt</strong> once fixes are applied or manual steps are marked done.</li>
           </ul>
         </div>
         <div class="learn-box">
           <h3 style="color:var(--danger);">What We NEVER Auto-Modify</h3>
           <ul>
-            <li>Nozzle or build plate temperatures</li>
+            <li>Nozzle, bed, or heated chamber temperatures</li>
             <li>Retraction distance, speed, flow ratio, Pressure Advance, or Z-offset</li>
-            <li>Filament cooling fan curves (shown as read-only guidance if too low)</li>
-            <li>Supports, scarf seams, or Variable Layer Height (shown as step-by-step manual guides so you can verify them visually in Preview)</li>
+            <li>Filament cooling fan curves (shown as read-only guidance matched to your filament)</li>
+            <li>Variable Layer Height (shown as a step-by-step manual guide so you can inspect the curve in Preview)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+        <div class="section-title" style="margin:0;">Smooth Surface Finish Guide (All Filaments &amp; Prerequisites)</div>
+        <span class="smooth-tag">Read Before Polishing</span>
+      </div>
+      <p style="font-size:12px;color:#cbd5e1;margin:0 0 10px;">
+        Slicer toolpath tweaks improve wall sheen, corner ringing, and seam transitions, <strong>but they cannot compensate for wet filament or uncalibrated extrusion</strong>. Check these fundamentals first:
+      </p>
+      <div class="learn-grid" style="margin-bottom:12px;">
+        <div class="learn-box">
+          <h3 style="color:var(--purple);">1. Mandatory Calibration &amp; Drying</h3>
+          <ol>
+            <li><strong>Dry Your Filament First:</strong> PETG, PA/Nylon, PC, TPU, ABS/ASA, CF/GF composites, and even older PLA absorb moisture. Damp filament boils in the nozzle, leaving micro-pits and rough walls no slicer setting can hide.</li>
+            <li><strong>Calibrate Flow Ratio (<code>Calibration -&gt; Flow Rate</code>):</strong> Even 3–5% over-extrusion creates tiny ridges where scarf seams overlap and roughens angled overhangs.</li>
+            <li><strong>Calibrate Pressure Advance (<code>Calibration -&gt; Pressure Advance</code>):</strong> Prevents bulging at sharp corners and blobs at seam start/stop points.</li>
+            <li><strong>Curved Tops &amp; Bottom Fillets:</strong> Process settings do not change Z-step height—use <strong>Variable Layer Height -&gt; Adaptive + Smooth</strong> on rounded tops or shallow bevels.</li>
+          </ol>
+        </div>
+        <div class="learn-box">
+          <h3 style="color:var(--teal);">2. How Smooth Mode Adapts by Material</h3>
+          <ul>
+            <li><strong>PLA / PLA+ / Matte / Wood / PVB:</strong> <code>60 mm/s</code> outer wall, conditional scarf seam ON, <code>80–100%</code> overhang fan. (PVB can also be misted with 90%+ IPA.)</li>
+            <li><strong>Silk / Glossy PLA:</strong> <code>45 mm/s</code> outer wall so mirror gloss stays uniform without dull speed-bands; conditional scarf seam ON.</li>
+            <li><strong>PETG / PCTG:</strong> <code>50 mm/s</code> outer wall, conditional scarf seam ON, <code>60–80%</code> overhang fan (low regular fan).</li>
+            <li><strong>CF / GF Composites (PETG-CF, PAHT-CF, PET-CF, PLA-CF, ABS-CF):</strong> <code>55 mm/s</code> outer wall, conditional scarf seam ON, low fan for high-temp composites, hardened nozzle required.</li>
+            <li><strong>ABS / ASA / PC / Nylon (PA):</strong> <code>45–55 mm/s</code> outer wall, conditional scarf seam ON, cooling capped low (<code>0–35%</code>) inside a warm enclosure.</li>
+            <li><strong>TPU / Flex &amp; Foaming Aero (PLA-AERO):</strong> <code>35–45 mm/s</code> outer wall, <strong>Scarf seams OFF</strong> to avoid pressure lag or foaming density changes.</li>
           </ul>
         </div>
       </div>
@@ -1924,13 +2536,14 @@ APP_HTML = """<!DOCTYPE html>
     <div class="card">
       <div class="section-title">Core Rules &amp; Built-In Safety Guardrails</div>
       <div class="rule-ref"><strong>0. Geometry-First Rule (No Blind Tips)</strong>Print Advisor refuses to suggest settings on an empty plate. Every tip requires real 3D geometry—either live from your active OrcaSlicer plate or from a dropped <code>.3mf</code> file.</div>
-      <div class="rule-ref"><strong>1. Steep Overhang &amp; Bottom Fillet Guard</strong>Detects 55°–85° downward faces (especially in the bottom 5mm). Slows overhang speeds, enforces Inner/Outer wall order, and provides a step-by-step Variable Layer Height guide that auto-clears once custom layering is detected on the plate or in the <code>.3mf</code>.</div>
+      <div class="rule-ref"><strong>1. Steep Overhang, Bottom Fillet &amp; Floating Bridge Guard</strong>Detects 55°–85° downward faces (especially in the bottom 5mm) plus horizontal floating bridges (&gt;85°). Slows overhang speeds, offers an opt-in breakaway Tree (Organic) support fix when supports are OFF (clearing automatically once active), and provides a step-by-step Variable Layer Height guide.</div>
       <div class="rule-ref"><strong>2. Nozzle Collision Prevention (Grid -&gt; Gyroid)</strong>Grid infill crosses over itself on the same layer, creating bumps the nozzle can strike. Gyroid never crosses itself.</div>
       <div class="rule-ref"><strong>3. Intent-Tailored Optimization</strong>Engineering: nozzle-aware shell walls (&gt;=1.2mm). Figure: finer layers + manual Scarf seam / Tree support guide. Prototype: opt-in wall/infill trim. Sign: Arachne walls + opt-in ironing.</div>
-      <div class="rule-ref"><strong>4. Tipping &amp; ABS/ASA Warp Guard</strong>Adds a 5mm outer brim when geometry is tall/narrow or printing high-shrinkage ABS/ASA (suppressed if Print-in-Place is ON).</div>
-      <div class="rule-ref"><strong>5. PETG &amp; TPU Stringing Guard</strong>Enables <em>Avoid crossing walls</em> so sticky or flexible filaments stay inside the part during travel.</div>
+      <div class="rule-ref"><strong>4. Tipping &amp; High-Warp Polymer Guard</strong>Adds a 5mm outer brim when geometry is tall/narrow or printing high-shrinkage polymers (ABS, ASA, PC, unfilled Nylon/PA) — suppressed if Print-in-Place is ON.</div>
+      <div class="rule-ref"><strong>5. PETG / PCTG / TPU Stringing Guard</strong>Enables <em>Avoid crossing walls</em> so sticky or flexible filaments stay inside the part during travel.</div>
       <div class="rule-ref"><strong>6. First-Layer Bond (CoreXY-Safe)</strong>Flags aggressive Layer 1 extrusion speeds without penalizing fast modern travel speeds.</div>
       <div class="rule-ref"><strong>7. Print-in-Place &amp; Safety Checks</strong>Disables brims + adds 0.15mm Elephant's Foot compensation for moving parts; protects Spiral Vase mode; checks non-manifold/inverted meshes, per-object overrides, printer mismatches, and strips stale G-code caches on export.</div>
+      <div class="rule-ref"><strong>8. Smooth Surface Finish Modifier (Cross-Profile, All Filaments)</strong>When toggled ON, layers material-aware outer-wall speed/acceleration caps (clamped downward only), Inner/Outer/Inner wall sequence, conditional scarf joint seams, and a filament/calibration readiness checklist onto any active intent.</div>
     </div>
   </div>
 </div>
@@ -1938,21 +2551,44 @@ APP_HTML = """<!DOCTYPE html>
 <script>
   const MAX_WARN_MB = 30;
   const MAX_BLOCK_MB = 60;
+  const SMOOTH_STORAGE_KEY = "print_advisor_smooth_enabled";
 
   let state = {
-    mode: "none",          // "none" | "3mf" | "live"
+    mode: "none",
     intent: "engineering",
     canExport3mf: false,
     canRevert: false,
     filename: "",
+    meta: null,
     mesh: null,
     tips: [],
     appliedFixes: [],
     good: [],
     guardrails: [],
     selectedIds: new Set(),
-    doneManualIds: new Set(), // Tracks manual cards checked off with 'Mark Done' for current scan
+    doneManualIds: new Set(),
   };
+
+  function isSmoothEnabled() {
+    const el = document.getElementById("smoothToggle");
+    return !!(el && el.checked);
+  }
+
+  function initSmoothToggle() {
+    try {
+      const saved = localStorage.getItem(SMOOTH_STORAGE_KEY);
+      if (saved === "1") {
+        document.getElementById("smoothToggle").checked = true;
+      }
+    } catch (e) {}
+  }
+
+  function onSmoothToggle() {
+    try {
+      localStorage.setItem(SMOOTH_STORAGE_KEY, isSmoothEnabled() ? "1" : "0");
+    } catch (e) {}
+    reEvaluate();
+  }
 
   function esc(str) {
     return String(str ?? "")
@@ -2010,6 +2646,10 @@ APP_HTML = """<!DOCTYPE html>
     document.getElementById("itemsBreakdownBox").classList.add("hidden");
     document.getElementById("emptyStateBox").classList.add("hidden");
     document.getElementById("analysisContent").classList.remove("hidden");
+    document.getElementById("downloadLive3mfBtn").classList.add("hidden");
+    document.getElementById("downloadLive3mfBtn").disabled = true;
+    document.getElementById("downloadReportBtn").classList.add("hidden");
+    document.getElementById("downloadReportBtn").disabled = true;
 
     if (hideWrap) document.getElementById("resultsWrap").classList.add("hidden");
   }
@@ -2040,17 +2680,18 @@ APP_HTML = """<!DOCTYPE html>
         type: "scan_live_plate",
         intent: state.intent,
         print_in_place: document.getElementById("pipToggle").checked,
+        smooth: isSmoothEnabled(),
       });
     } else if (state.mode === "3mf") {
       window.orca.postMessage({
         type: "evaluate_3mf",
         intent: state.intent,
         print_in_place: document.getElementById("pipToggle").checked,
+        smooth: isSmoothEnabled(),
       });
     }
   }
 
-  // Explicit scan / re-scan clears manual 'Mark Done' state so swapping models never hides new warnings
   function scanLivePlate() {
     state.mode = "live";
     state.filename = "";
@@ -2064,6 +2705,7 @@ APP_HTML = """<!DOCTYPE html>
       type: "scan_live_plate",
       intent: state.intent,
       print_in_place: document.getElementById("pipToggle").checked,
+      smooth: isSmoothEnabled(),
     });
   }
 
@@ -2074,7 +2716,15 @@ APP_HTML = """<!DOCTYPE html>
       type: "revert_live",
       intent: state.intent,
       print_in_place: document.getElementById("pipToggle").checked,
+      smooth: isSmoothEnabled(),
     });
+  }
+
+  function exportLive3mf() {
+    const doneManualCount = state.tips.filter((t) => t.manual_only && state.doneManualIds.has(t.id)).length;
+    if (state.mode !== "live" || (state.appliedFixes.length + doneManualCount) === 0) return;
+    setStatus("Packaging active plate and applied fixes into .3mf...");
+    window.orca.postMessage({ type: "export_live_3mf" });
   }
 
   function markManualDone(tipId) {
@@ -2097,6 +2747,7 @@ APP_HTML = """<!DOCTYPE html>
   }
 
   function updateContextStrip(meta) {
+    state.meta = meta;
     document.getElementById("ctxPrinter").textContent = meta.printer;
     document.getElementById("ctxNozzle").textContent = meta.nozzle + " mm";
     document.getElementById("ctxFilament").textContent = `${meta.filament} (${meta.filament_type})`;
@@ -2104,7 +2755,6 @@ APP_HTML = """<!DOCTYPE html>
     if (meta.source_label) document.getElementById("ctxSource").textContent = meta.source_label;
   }
 
-  // Shared geometry protection status used by BOTH top #meshBadges and bottom Mesh & Model Inspector
   function getGeometryStatus(m) {
     const pendingIds = new Set(
       state.tips
@@ -2120,30 +2770,32 @@ APP_HTML = """<!DOCTYPE html>
     const isTippy = !m.inverted_normals && (
       m.worst_tipping_ratio >= 2.8 || (m.min_bed_area_mm2 < 250.0 && m.max_size_mm[2] >= 40.0)
     );
-    const bridgeWarn = !m.inverted_normals && m.total_bridge_mm2 >= 40.0;
+    const hasBridges = !m.inverted_normals && m.total_bridge_mm2 >= 40.0;
+    const bridgeProtected = hasBridges && !!m.supports_enabled;
     const pipOn = document.getElementById("pipToggle").checked;
 
-    return { overhangPending, filletPending, brimPending, hasFillet, hasOverhang, isTippy, bridgeWarn, pipOn };
+    return { overhangPending, filletPending, brimPending, hasFillet, hasOverhang, isTippy, hasBridges, bridgeProtected, pipOn };
   }
 
   function renderModeBar(isEmpty) {
     const bar = document.getElementById("modeBar");
+    const smoothSuffix = isSmoothEnabled() ? ` &nbsp;<span class="badge purple">Smooth: ON</span>` : "";
     if (isEmpty) {
       bar.className = "mode-bar empty-plate";
       bar.innerHTML = `
-        <div><strong>Active OrcaSlicer Plate &mdash; Empty</strong> (No 3D models detected)</div>
+        <div><strong>Active OrcaSlicer Plate &mdash; Empty</strong> (No 3D models detected)${smoothSuffix}</div>
         <button class="btn btn-secondary btn-sm" onclick="scanLivePlate()">Re-Scan Plate</button>
       `;
     } else if (state.mode === "3mf") {
       bar.className = "mode-bar";
       bar.innerHTML = `
-        <div><strong>Mode: Loaded .3mf File</strong> &mdash; ${esc(state.filename)} (3D Geometry + Embedded Settings)</div>
+        <div><strong>Mode: Loaded .3mf File</strong> &mdash; ${esc(state.filename)} (3D Geometry + Embedded Settings)${smoothSuffix}</div>
         <button class="btn btn-secondary btn-sm" onclick="clearAll()">Clear .3mf</button>
       `;
     } else {
       bar.className = "mode-bar live-plate";
       bar.innerHTML = `
-        <div><strong>Mode: Active OrcaSlicer Plate</strong> &mdash; Live 3D Geometry + Active Process Preset</div>
+        <div><strong>Mode: Active OrcaSlicer Plate</strong> &mdash; Live 3D Geometry + Active Process Preset${smoothSuffix}</div>
         <button class="btn btn-secondary btn-sm" onclick="scanLivePlate()">Re-Scan Plate</button>
       `;
     }
@@ -2168,6 +2820,9 @@ APP_HTML = """<!DOCTYPE html>
 
     const overhangCls = g.hasOverhang ? (g.overhangPending ? "warn" : "ok") : "";
     const overhangTag = g.hasOverhang ? (g.overhangPending ? " · Needs Fix" : " · Protected") : "";
+
+    const bridgeCls = g.hasBridges ? (g.bridgeProtected ? "ok" : "warn") : "";
+    const bridgeTag = g.hasBridges ? (g.bridgeProtected ? " · Supports Active" : " · Supports OFF") : "";
 
     let tipCls = "ok";
     let tipTag = "(Stable)";
@@ -2217,9 +2872,9 @@ APP_HTML = """<!DOCTYPE html>
         <span>Total Steep Overhangs (55°–85°)</span>
         <strong>${esc(m.worst_overhang_pct)}% (${esc(m.total_steep_mm2)} mm&sup2;)${overhangTag}</strong>
       </div>
-      <div class="stat ${g.bridgeWarn ? "warn" : ""}">
+      <div class="stat ${bridgeCls}">
         <span>Floating Bridges (&gt;85°)</span>
-        <strong>${esc(m.total_bridge_mm2)} mm&sup2;</strong>
+        <strong>${esc(m.total_bridge_mm2)} mm&sup2;${bridgeTag}</strong>
       </div>
       <div class="stat">
         <span>Baseline Slice Info</span>
@@ -2259,6 +2914,7 @@ APP_HTML = """<!DOCTYPE html>
   function renderImpactBar() {
     const bar = document.getElementById("impactBar");
     const chosen = state.tips.filter((t) => !t.manual_only && state.selectedIds.has(t.id));
+    const doneManualCount = state.tips.filter((t) => t.manual_only && state.doneManualIds.has(t.id)).length;
 
     let sumTimePct = 0, sumTimeMin = 0, sumFilPct = 0, sumFilG = 0;
     chosen.forEach((t) => {
@@ -2295,7 +2951,32 @@ APP_HTML = """<!DOCTYPE html>
     bar.innerHTML = html;
 
     const btn = document.getElementById("primaryActionBtn");
+    const liveDlBtn = document.getElementById("downloadLive3mfBtn");
+    const reportBtn = document.getElementById("downloadReportBtn");
+
     if (state.mode === "live") {
+      const totalOptimized = state.appliedFixes.length + doneManualCount;
+      liveDlBtn.classList.remove("hidden");
+      reportBtn.classList.remove("hidden");
+
+      if (totalOptimized > 0) {
+        liveDlBtn.disabled = false;
+        liveDlBtn.title = "Download a new _advised.3mf file with your applied fixes and completed manual steps";
+        liveDlBtn.textContent = `Download Optimized .3mf (${totalOptimized})`;
+
+        reportBtn.disabled = false;
+        reportBtn.title = "Download a report.txt file listing all applied fixes and completed manual steps";
+        reportBtn.textContent = `Download Report.txt (${totalOptimized})`;
+      } else {
+        liveDlBtn.disabled = true;
+        liveDlBtn.title = "Apply fixes or mark manual steps done to unlock .3mf download";
+        liveDlBtn.textContent = "Download Optimized .3mf";
+
+        reportBtn.disabled = true;
+        reportBtn.title = "Apply fixes or mark manual steps done to download report.txt";
+        reportBtn.textContent = "Download Report.txt";
+      }
+
       if (chosen.length === 0) {
         btn.disabled = true;
         btn.title = "Select at least one safe fix to apply to your active plate";
@@ -2306,20 +2987,36 @@ APP_HTML = """<!DOCTYPE html>
         btn.textContent = `Apply Selected to Active Plate (${chosen.length})`;
       }
     } else if (state.mode === "3mf") {
+      const total3mfCount = chosen.length + doneManualCount;
+      liveDlBtn.classList.add("hidden");
+      reportBtn.classList.remove("hidden");
+
+      if (total3mfCount > 0) {
+        reportBtn.disabled = false;
+        reportBtn.title = "Download a report.txt file listing all selected fixes and completed manual steps";
+        reportBtn.textContent = `Download Report.txt (${total3mfCount})`;
+      } else {
+        reportBtn.disabled = true;
+        reportBtn.title = "Select fixes or mark manual steps done to download report.txt";
+        reportBtn.textContent = "Download Report.txt";
+      }
+
       if (!state.canExport3mf) {
         btn.disabled = true;
         btn.title = "Raw CAD .3mf has no embedded slicer profile — save in OrcaSlicer first or apply manually";
         btn.textContent = "Raw CAD .3mf (Apply Manually)";
-      } else if (chosen.length === 0) {
+      } else if (total3mfCount === 0) {
         btn.disabled = true;
         btn.title = "Select at least one fix to export";
         btn.textContent = "Select Fixes to Export";
       } else {
         btn.disabled = false;
-        btn.title = "Saves a new non-destructive _advised.3mf with only your checked fixes";
-        btn.textContent = `Download Optimized .3mf (${chosen.length})`;
+        btn.title = "Saves a new non-destructive _advised.3mf with your selected fixes";
+        btn.textContent = `Download Optimized .3mf (${total3mfCount})`;
       }
     } else {
+      liveDlBtn.classList.add("hidden");
+      reportBtn.classList.add("hidden");
       btn.disabled = true;
       btn.textContent = "No Model Loaded";
     }
@@ -2335,6 +3032,7 @@ APP_HTML = """<!DOCTYPE html>
 
   function renderTipCard(t) {
     const isManual = !!t.manual_only;
+    const isSmooth = t.tag === "Smooth";
     const checked = !isManual && state.selectedIds.has(t.id);
     const diffsHtml = t.diffs.map((d) => `
       <div class="diff-row">
@@ -2356,6 +3054,8 @@ APP_HTML = """<!DOCTYPE html>
       ? `<span class="manual-tag">Manual</span>`
       : `<input type="checkbox" ${checked ? "checked" : ""} onchange="toggleTip('${safeId}', this.checked)" />`;
 
+    const tagBadge = t.tag ? `<span class="smooth-tag">${esc(t.tag)}</span>` : "";
+
     const pathOrFooter = isManual
       ? `<div class="manual-footer">
            <div class="tip-manual">Manual path: ${esc(t.manual_path)}</div>
@@ -2363,13 +3063,23 @@ APP_HTML = """<!DOCTYPE html>
          </div>`
       : `<div class="tip-manual">Manual path: ${esc(t.manual_path)}</div>`;
 
+    const cardClasses = [
+      "tip-card",
+      isManual ? "manual" : esc(t.bucket),
+      isSmooth ? "smooth-card" : "",
+      (!isManual && !checked) ? "unchecked" : "",
+    ].filter(Boolean).join(" ");
+
     return `
-      <div class="tip-card ${isManual ? "manual" : `${esc(t.bucket)} ${checked ? "" : "unchecked"}`}" data-id="${safeId}">
+      <div class="${cardClasses}" data-id="${safeId}">
         <div class="tip-top">
           ${leftCtrl}
           <div class="tip-body">
             <div class="tip-title-row">
-              <span class="tip-title">${esc(t.title)}</span>
+              <div class="tip-title-group">
+                <span class="tip-title">${esc(t.title)}</span>
+                ${tagBadge}
+              </div>
               <span class="impact-pill">${esc(t.impact.label)}</span>
             </div>
             <div class="tip-detected">${esc(t.detected)}</div>
@@ -2437,6 +3147,11 @@ APP_HTML = """<!DOCTYPE html>
           b.push(g.filletPending
             ? `<span class="badge amber">Bottom Fillets: ${esc(m.worst_bottom_fillet_pct)}% (${esc(m.total_bottom_fillet_mm2)} mm&sup2;)</span>`
             : `<span class="badge green">Bottom Fillets: ${esc(m.worst_bottom_fillet_pct)}% &middot; Protected</span>`);
+        }
+        if (g.hasBridges) {
+          b.push(g.bridgeProtected
+            ? `<span class="badge green">Bridges: ${esc(m.total_bridge_mm2)} mm&sup2; &middot; Supports Active</span>`
+            : `<span class="badge amber">Bridges: ${esc(m.total_bridge_mm2)} mm&sup2; &middot; Supports OFF</span>`);
         }
         if (g.isTippy) {
           if (g.pipOn) {
@@ -2519,24 +3234,121 @@ APP_HTML = """<!DOCTYPE html>
 
   function applyOrExport() {
     const ids = Array.from(state.selectedIds);
-    if (!ids.length) return;
+    const doneManualCount = state.tips.filter((t) => t.manual_only && state.doneManualIds.has(t.id)).length;
     if (state.mode === "live") {
+      if (!ids.length) return;
       setStatus("Applying selected settings to active OrcaSlicer process preset...");
       window.orca.postMessage({
         type: "apply_live",
         selected_ids: ids,
         intent: state.intent,
         print_in_place: document.getElementById("pipToggle").checked,
+        smooth: isSmoothEnabled(),
       });
     } else if (state.mode === "3mf") {
+      if ((ids.length + doneManualCount) === 0) return;
       setStatus("Building optimized .3mf...");
       window.orca.postMessage({
         type: "export_3mf",
         selected_ids: ids,
         intent: state.intent,
         print_in_place: document.getElementById("pipToggle").checked,
+        smooth: isSmoothEnabled(),
       });
     }
+  }
+
+  function downloadReportTxt() {
+    const doneManualTips = state.tips.filter((t) => t.manual_only && state.doneManualIds.has(t.id));
+    const appliedItems = state.mode === "live"
+      ? state.appliedFixes
+      : state.tips.filter((t) => !t.manual_only && state.selectedIds.has(t.id));
+
+    if ((appliedItems.length + doneManualTips.length) === 0) return;
+
+    const meta = state.meta || {};
+    const stem = state.mode === "3mf"
+      ? (state.filename.toLowerCase().endsWith(".3mf") ? state.filename.slice(0, -4) : state.filename)
+      : ((state.mesh && state.mesh.plate_stem) ? state.mesh.plate_stem : "active_plate");
+
+    const lines = [
+      "============================================================",
+      "PRINT ADVISOR — APPLIED OPTIMIZATION REPORT",
+      "============================================================",
+      `Source:         ${state.mode === "3mf" ? state.filename : "Active OrcaSlicer Plate"}`,
+      `Printer:        ${meta.printer || "Unknown"} (${meta.nozzle || "0.4"} mm nozzle)`,
+      `Filament:       ${meta.filament || "Unknown"} (${meta.filament_type || "Unknown"})`,
+      `Process Preset: ${meta.process || "Unknown"}`,
+      `Intent:         ${state.intent}`,
+      `Print-in-Place: ${document.getElementById("pipToggle").checked ? "ON" : "OFF"}`,
+      `Smooth Finish:  ${isSmoothEnabled() ? "ON" : "OFF"}`,
+      "",
+    ];
+
+    lines.push(`APPLIED PROCESS FIXES (${appliedItems.length}):`);
+    lines.push("------------------------------------------------------------");
+    if (!appliedItems.length) {
+      lines.push("None (only manual checklist steps were marked done).");
+    } else {
+      appliedItems.forEach((item, idx) => {
+        const tagPrefix = item.tag ? `[${item.tag.toUpperCase()}] ` : "";
+        lines.push(`${idx + 1}. ${tagPrefix}${item.title}`);
+        (item.diffs || []).forEach((d) => {
+          lines.push(`   - ${d.label}: ${d.before}  -->  ${d.after}`);
+        });
+        if (item.patches && Object.keys(item.patches).length) {
+          const kv = Object.entries(item.patches).map(([k, v]) => `${k} = ${v}`).join(", ");
+          lines.push(`   - Config keys: ${kv}`);
+        }
+        if (item.manual_path) {
+          lines.push(`   - OrcaSlicer path: ${item.manual_path}`);
+        }
+      });
+    }
+    lines.push("");
+
+    lines.push(`COMPLETED MANUAL STEPS (${doneManualTips.length}):`);
+    lines.push("------------------------------------------------------------");
+    if (!doneManualTips.length) {
+      lines.push("None.");
+    } else {
+      doneManualTips.forEach((t, idx) => {
+        const tagPrefix = t.tag ? `[${t.tag.toUpperCase()}] ` : "";
+        lines.push(`${idx + 1}. ${tagPrefix}${t.title}`);
+        (t.diffs || []).forEach((d) => {
+          lines.push(`   - ${d.label}: ${d.before}  -->  ${d.after}`);
+        });
+        if (t.manual_path) {
+          lines.push(`   - OrcaSlicer path: ${t.manual_path}`);
+        }
+      });
+    }
+    lines.push("");
+
+    const remainingPending = state.tips.filter(
+      (t) => (t.manual_only && !state.doneManualIds.has(t.id)) || (!t.manual_only && !state.selectedIds.has(t.id))
+    );
+    if (remainingPending.length) {
+      lines.push(`REMAINING UNAPPLIED / PENDING ITEMS (${remainingPending.length}):`);
+      lines.push("------------------------------------------------------------");
+      remainingPending.forEach((t, idx) => {
+        const kind = t.manual_only ? "[MANUAL PENDING]" : "[UNSELECTED]";
+        lines.push(`${idx + 1}. ${kind} ${t.title}`);
+      });
+      lines.push("");
+    }
+
+    const reportFilename = `${stem}_report.txt`;
+    const blob = new Blob([lines.join("\\r\\n")], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = reportFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    setStatus(`Saved ${reportFilename} (${appliedItems.length + doneManualTips.length} item(s) logged).`, "ok");
   }
 
   function copySummary() {
@@ -2545,7 +3357,7 @@ APP_HTML = """<!DOCTYPE html>
     );
     const lines = [
       `Print Advisor Summary — ${state.mode === "3mf" ? state.filename : "Active OrcaSlicer Plate"}`,
-      `Intent: ${state.intent} | Print-in-Place: ${document.getElementById("pipToggle").checked ? "ON" : "OFF"}`,
+      `Intent: ${state.intent} | Print-in-Place: ${document.getElementById("pipToggle").checked ? "ON" : "OFF"} | Smooth: ${isSmoothEnabled() ? "ON" : "OFF"}`,
       "",
     ];
     if (state.mode === "live" && state.appliedFixes.length) {
@@ -2561,7 +3373,8 @@ APP_HTML = """<!DOCTYPE html>
     } else {
       lines.push("Pending / Manual Items:");
       chosen.forEach((t, i) => {
-        lines.push(`${i + 1}. ${t.manual_only ? "[MANUAL] " : ""}${t.title} (${t.impact.label})`);
+        const prefix = `${t.manual_only ? "[MANUAL] " : ""}${t.tag ? `[${t.tag.toUpperCase()}] ` : ""}`;
+        lines.push(`${i + 1}. ${prefix}${t.title} (${t.impact.label})`);
         t.diffs.forEach((d) => lines.push(`   - ${d.label}: ${d.before} -> ${d.after}`));
         lines.push(`   Manual: ${t.manual_path}`);
       });
@@ -2635,7 +3448,7 @@ APP_HTML = """<!DOCTYPE html>
         return;
       }
       triggerBlobDownload(msg.filename, msg.content_b64);
-      setStatus(`Saved ${msg.filename} (${msg.keys_patched} setting(s) updated; stale G-code stripped). Open in OrcaSlicer and slice!`, "ok");
+      setStatus(`Saved ${msg.filename} (${msg.keys_patched} setting(s) registered). Open in OrcaSlicer and slice!`, "ok");
     }
   });
 
@@ -2664,6 +3477,7 @@ APP_HTML = """<!DOCTYPE html>
         content_b64: reader.result.split(",")[1],
         intent: state.intent,
         print_in_place: document.getElementById("pipToggle").checked,
+        smooth: isSmoothEnabled(),
       });
     };
     reader.readAsDataURL(file);
@@ -2686,6 +3500,7 @@ APP_HTML = """<!DOCTYPE html>
     if (!document.hidden && state.mode !== "3mf") requestContext();
   });
 
+  initSmoothToggle();
   requestContext();
 </script>
 </body>
@@ -2706,9 +3521,9 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
         self._cached_bytes = None
         self._cached_mesh = None
         self._cached_project_settings = None
-        self._live_applied_fixes = []    # Applied tips shown in the Live Plate collapsible
-        self._live_revert_snapshot = {}  # Original pre-patch process values for 1-click Revert
-        self._live_revert_preset = ""    # Clean process preset name the snapshot belongs to
+        self._live_applied_fixes = []
+        self._live_revert_snapshot = {}
+        self._live_revert_preset = ""
 
     def get_name(self):
         return "Print Advisor"
@@ -2727,9 +3542,9 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
         self._live_revert_snapshot = {}
         self._live_revert_preset = ""
 
-    def _collect_selected_and_patches(self, ctx, mesh, selected_ids, intent, print_in_place):
+    def _collect_selected_and_patches(self, ctx, mesh, selected_ids, intent, print_in_place, smooth=False):
         """Re-evaluates rules and returns (chosen_tips, merged_patches) with Priority 1 winning conflicts."""
-        res = RuleEngine.evaluate(ctx, mesh, intent=intent, print_in_place=print_in_place)
+        res = RuleEngine.evaluate(ctx, mesh, intent=intent, print_in_place=print_in_place, smooth=smooth)
         chosen = [t for t in res["tips"] if not t.get("manual_only") and t["id"] in selected_ids]
         chosen_ordered = sorted(chosen, key=lambda t: t["priority"], reverse=True)
         merged = {}
@@ -2742,7 +3557,14 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
         by_id = {item["id"]: item for item in self._live_applied_fixes}
         order = [item["id"] for item in self._live_applied_fixes]
         for t in chosen_tips:
-            entry = {"id": t["id"], "title": t["title"], "diffs": t.get("diffs", [])}
+            entry = {
+                "id": t["id"],
+                "title": t["title"],
+                "tag": t.get("tag", ""),
+                "manual_path": t.get("manual_path", ""),
+                "diffs": t.get("diffs", []),
+                "patches": t.get("patches", {}),
+            }
             by_id[t["id"]] = entry
             if t["id"] not in order:
                 order.append(t["id"])
@@ -2750,7 +3572,7 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
 
     def _emit_evaluation(
         self, source_mode, mesh, proj_settings, intent, print_in_place,
-        elapsed_ms=None, status_override=None, status_tone="ok", just_applied=False,
+        smooth=False, elapsed_ms=None, status_override=None, status_tone="ok", just_applied=False,
     ):
         ctx = ContextReader.build_effective_context(proj_settings)
 
@@ -2765,10 +3587,10 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
             })
             return
 
-        res = RuleEngine.evaluate(ctx, mesh, intent=intent, print_in_place=print_in_place)
+        res = RuleEngine.evaluate(ctx, mesh, intent=intent, print_in_place=print_in_place, smooth=smooth)
         mesh_public = {k: v for k, v in mesh.items() if k != "project_settings"}
+        mesh_public["supports_enabled"] = (ctx["settings"].get("enable_support", "0") == "1")
 
-        # Keep live applied history & revert snapshot scoped strictly to the same process preset
         applied_for_ui = []
         can_revert = False
         if source_mode == "live":
@@ -2822,14 +3644,16 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
             t0 = time.perf_counter()
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
             live_mesh = LivePlateAnalyzer.analyze()
             elapsed_ms = round((time.perf_counter() - t0) * 1000)
-            self._emit_evaluation("live", live_mesh, None, intent, pip, elapsed_ms=elapsed_ms)
+            self._emit_evaluation("live", live_mesh, None, intent, pip, smooth=smooth, elapsed_ms=elapsed_ms)
 
         elif msg_type == "apply_live":
             selected_ids = set(data.get("selected_ids", []))
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
             try:
                 live_mesh = LivePlateAnalyzer.analyze()
                 if live_mesh.get("empty"):
@@ -2841,17 +3665,37 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
                 if self._live_revert_preset and self._live_revert_preset != current_proc:
                     self._clear_live_history()
 
-                chosen, merged = self._collect_selected_and_patches(ctx, live_mesh, selected_ids, intent, pip)
+                chosen, merged = self._collect_selected_and_patches(ctx, live_mesh, selected_ids, intent, pip, smooth=smooth)
                 if not merged:
                     self.post_message({"type": "apply_live_error", "error": "No applicable settings selected."})
                     return
 
-                # Capture first-seen original values before applying so Revert always restores true baseline
-                pending_snapshot = {
-                    k: ctx["settings"][k]
-                    for k in merged
-                    if k not in self._live_revert_snapshot and k in ctx["settings"]
+                fallback_defaults = {
+                    "seam_slope_conditional": "0",
+                    "seam_slope_steps": "10",
+                    "seam_slope_type": "none",
+                    "seam_position": "aligned",
+                    "reduce_crossing_wall": "0",
+                    "outer_wall_acceleration": "0",
+                    "enable_support": "0",
+                    "support_type": "normal(auto)",
+                    "support_style": "default",
+                    "support_on_build_plate_only": "0",
+                    "support_top_z_distance": "0.2",
+                    "support_interface_top_layers": "2",
                 }
+                bundle = orca.host.preset_bundle()
+                pending_snapshot = {}
+                for k in merged:
+                    if k not in self._live_revert_snapshot:
+                        if k in ctx["settings"]:
+                            pending_snapshot[k] = ctx["settings"][k]
+                        else:
+                            try:
+                                raw_cur = normalize_val(bundle.full_config_value(k))
+                            except Exception:
+                                raw_cur = None
+                            pending_snapshot[k] = raw_cur if raw_cur is not None else fallback_defaults.get(k, "0")
 
                 res = LivePlatePatcher.apply(merged)
                 self._live_revert_preset = current_proc
@@ -2861,10 +3705,10 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
                 target = f" '{res['target_name']}'" if res.get("target_name") else ""
                 notice = (
                     f"Applied {res['applied']} setting(s) to active process{target} "
-                    f"(unsaved — switch to Prepare/Preview to slice, or click Revert above)."
+                    f"(unsaved — slice in Preview, click Revert above, or Download Optimized .3mf / Report.txt)."
                 )
                 self._emit_evaluation(
-                    "live", live_mesh, None, intent, pip,
+                    "live", live_mesh, None, intent, pip, smooth=smooth,
                     status_override=notice, just_applied=True,
                 )
             except Exception as e:
@@ -2873,6 +3717,7 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
         elif msg_type == "revert_live":
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
             if not self._live_revert_snapshot:
                 self.post_message({"type": "apply_live_error", "error": "Nothing to revert."})
                 return
@@ -2883,7 +3728,7 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
                     self._clear_live_history()
                     live_mesh = LivePlateAnalyzer.analyze()
                     self._emit_evaluation(
-                        "live", live_mesh, None, intent, pip,
+                        "live", live_mesh, None, intent, pip, smooth=smooth,
                         status_override=f"Revert skipped: active process changed from '{old_proc}' to '{current_proc}'.",
                         status_tone="err",
                     )
@@ -2894,11 +3739,23 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
                 live_mesh = LivePlateAnalyzer.analyze()
                 notice = f"Reverted {res['applied']} setting(s) back to your original process values."
                 self._emit_evaluation(
-                    "live", live_mesh, None, intent, pip,
+                    "live", live_mesh, None, intent, pip, smooth=smooth,
                     status_override=notice, status_tone="ok",
                 )
             except Exception as e:
                 self.post_message({"type": "apply_live_error", "error": f"Revert failed: {e}"})
+
+        elif msg_type == "export_live_3mf":
+            try:
+                out_name, raw_bytes, keys_count = LivePlateExporter.export(list(self._live_revert_snapshot.keys()))
+                self.post_message({
+                    "type": "export_ready",
+                    "filename": out_name,
+                    "keys_patched": keys_count,
+                    "content_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                })
+            except Exception as e:
+                self.post_message({"type": "export_ready", "error": str(e)})
 
         elif msg_type == "load_3mf":
             self._clear_live_history()
@@ -2906,6 +3763,7 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
             filename = data.get("filename", "model.3mf")
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
             try:
                 raw_bytes = base64.b64decode(data.get("content_b64", ""))
                 with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf:
@@ -2920,22 +3778,27 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
                 self._cached_project_settings = mesh_result.get("project_settings")
 
                 elapsed_ms = round((time.perf_counter() - t0) * 1000)
-                self._emit_evaluation("3mf", mesh_result, self._cached_project_settings, intent, pip, elapsed_ms=elapsed_ms)
+                self._emit_evaluation(
+                    "3mf", mesh_result, self._cached_project_settings, intent, pip,
+                    smooth=smooth, elapsed_ms=elapsed_ms,
+                )
             except Exception as e:
                 self.post_message({"type": "evaluation", "error": str(e)})
 
         elif msg_type == "evaluate_3mf":
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
             if self._cached_mesh is None:
-                self._emit_evaluation("live", {"empty": True, "reason": "No .3mf loaded."}, None, intent, pip)
+                self._emit_evaluation("live", {"empty": True, "reason": "No .3mf loaded."}, None, intent, pip, smooth=smooth)
                 return
-            self._emit_evaluation("3mf", self._cached_mesh, self._cached_project_settings, intent, pip)
+            self._emit_evaluation("3mf", self._cached_mesh, self._cached_project_settings, intent, pip, smooth=smooth)
 
         elif msg_type == "export_3mf":
             selected_ids = set(data.get("selected_ids", []))
             intent = data.get("intent", "engineering")
             pip = bool(data.get("print_in_place", False))
+            smooth = bool(data.get("smooth", False))
 
             if not self._cached_bytes or not self._cached_project_settings:
                 self.post_message({"type": "export_ready", "error": "No patchable .3mf loaded."})
@@ -2943,7 +3806,7 @@ class PrintAdvisorPage(orca.pages.PagesPluginCapabilityBase):
 
             try:
                 ctx = ContextReader.build_effective_context(self._cached_project_settings)
-                _, merged = self._collect_selected_and_patches(ctx, self._cached_mesh, selected_ids, intent, pip)
+                _, merged = self._collect_selected_and_patches(ctx, self._cached_mesh, selected_ids, intent, pip, smooth=smooth)
                 patched_bytes = ThreeMFPatcher.patch(self._cached_bytes, merged)
                 stem = self._cached_filename[:-4] if self._cached_filename.lower().endswith(".3mf") else self._cached_filename
 
