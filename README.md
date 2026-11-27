@@ -32,7 +32,7 @@ If you drop an unconverted `.3mf` built for a different machine directly into Pr
 
 ## What It Checks
 
-1. **Steep Overhangs & Bottom Fillets (55°–85°):** Detects curling-prone curved base edges (bottom 5 mm) and steep overhangs; recommends overhang slowdowns, inner-first wall order, and provides a step-by-step **Variable Layer Height** guide that auto-clears once custom layering is detected (`has_custom_layering` on live plates or `layer_heights_profile.txt` in `.3mf` files).
+1. **Steep Overhangs & Bottom Fillets (55°–85°):** Detects curling-prone curved base edges (bottom 5 mm) and steep overhangs; recommends overhang slowdowns, inner-first wall order, and provides a step-by-step **Variable Layer Height** guide (automatically suppressed when supports are active, with an amber `⚠` warning not to combine VLH with Organic/Tree supports).
 2. **Floating Horizontal Bridges (`>85°`):** Detects unsupported mid-air ceilings and bridges (`>= 40 mm²`). When supports are already active, it clears into **Already Good** (`Supports Active`); when supports are OFF, it offers an **opt-in** breakaway **Tree (Auto) · Organic** support fix (`On build plate only`, `2` interface layers) with material-tuned **Top Z distance**.
 3. **Nozzle Collision Prevention:** Flags self-intersecting **Grid** infill and recommends **Gyroid**.
 4. **Goal-Specific Tuning:**
@@ -48,6 +48,7 @@ If you drop an unconverted `.3mf` built for a different machine directly into Pr
 
 ### Built-In Safety Guardrails
 - **Spiral Vase Protection:** Automatically bypasses wall, infill, layer height, seam, bridge support, and wall-order rules.
+- **VLH + Organic Support Conflict Guard:** Automatically suppresses Variable Layer Height tips when supports are active and warns if both are already enabled on the same model (since OrcaSlicer cannot slice VLH with Organic supports).
 - **Mesh Health Checks:** Detects non-manifold parts, inverted base normals, floating bridges, and skips non-printable modifier/negative volumes.
 - **Per-Object Override & Printer Mismatch Warnings:** Alerts you if a part overrides a global setting or if a `.3mf` belongs to a different printer (recommending [Orca MakerWorld Importer](https://github.com/FleeceFlames/Orca_makerworld_importer) first).
 - **Preset-Locked 1-Click Revert:** Captures your full baseline before patching and tracks the exact process preset you modified so switching profiles in OrcaSlicer never applies stale revert values to a different preset.
@@ -76,7 +77,7 @@ Slicer toolpath tweaks improve wall sheen, corner ringing, and seam transitions,
 1. **Dry Your Filament First:** PETG, PA/Nylon, PC, TPU, ABS/ASA, CF/GF composites, and even older PLA absorb moisture from the air. Damp filament boils inside the nozzle, leaving micro-pits, fuzzy walls, and stringing that no slicer setting can hide.
 2. **Calibrate Flow Ratio (`Calibration → Flow Rate`):** Even 3–5% over-extrusion creates tiny ridges where scarf seams overlap and roughens angled overhangs.
 3. **Calibrate Pressure Advance (`Calibration → Pressure Advance`):** Prevents bulging at sharp corners and blobs at seam start/stop points.
-4. **Use Variable Layer Height on Rounded Tops & Bevels:** Process settings do not change Z-step height—use **Variable Layer Height → Adaptive + Smooth** on domes, fillets, or shallow chamfers.
+4. **Use Variable Layer Height on Rounded Tops & Bevels:** Process settings do not change Z-step height—use **Variable Layer Height → Adaptive + Smooth** on domes, fillets, or shallow chamfers (when not using Organic/Tree supports).
 
 ### How Smooth Mode Adapts by Material
 
@@ -101,6 +102,8 @@ Steep rounded edges near the build plate (bottom fillets) often curl at `0.20 mm
 2. Slide **Quality / Speed** slightly left to **`0.25–0.35`** (or leave at `0.50` for a milder effect) and click **Adaptive** once.
 3. Leave **Radius** at `5`, click **Smooth** 1–2 times to soften layer transitions, then click **Done**.
 4. Return to **Print Advisor** and click **Re-Scan Plate**—Print Advisor detects custom layering automatically, marks **`VLH: Active`**, and clears the manual tip.
+
+> **Warning:** Do not combine **Variable Layer Height** with **Organic / Tree supports**—OrcaSlicer cannot slice both together. Print Advisor automatically suppresses VLH tips when supports are enabled.
 
 ### 2. How to Verify Overhangs, Bridges & Layer Heights in the Preview Tab
 - **Don't panic at red areas:** In **Line Type** view, **Red** is just a normal **Top surface** (completely healthy). Actual problem zones are **Dark Blue (`Overhang wall`)** and **Blue (`Bridge`)**.
@@ -129,10 +132,8 @@ The numbers inside **Mesh & Model Inspector** (dimensions, bed area, bottom fill
 
 ### Option A: Orca Cloud (Recommended)
 1. Open **OrcaSlicer 2.5+** and go to the **Plugins / Orca Cloud** tab.
-2. Search for **[Print Advisor](https://cloud.orcaslicer.com/p/3b308f5ef16a)** and click **Install** (or **Update** if you already have `v1.0.0` installed).
+2. Search for **[Print Advisor](https://cloud.orcaslicer.com/p/3b308f5ef16a)** and click **Install** (or **Update** if you already have an earlier version installed).
 3. Open the new **Print Advisor** tab—no extra permissions needed.
-
-> **Latest on Orca Cloud (`v1.0.1`):** Adds the **Smooth Surface Finish** toggle (14 filament families, downward-clamped speeds/acceleration, `Inner/Outer/Inner` wall order, and conditional scarf seams), an opt-in **Tree (Auto) · Organic** support fix for floating bridges (`>85°`), and **Live Plate `.3mf` (`*_advised.3mf`) + `report.txt` (`*_report.txt`)** export. See the full [Changelog](#changelog) below.
 
 ### Option B: Manual Local Install
 1. Download `print_advisor_any.py` from the [Releases](https://github.com/FleeceFlames/Orca_Print_Advisor/releases) page.
@@ -141,8 +142,21 @@ The numbers inside **Mesh & Model Inspector** (dimensions, bed area, bottom fill
 
 ---
 
+## Contributing a Translation
+
+Want to translate **Print Advisor** into your language? All UI and rule text lives in a single `TRANSLATIONS` dictionary near the top of `print_advisor_any.py`:
+
+1. Open `print_advisor_any.py` and copy the `"en": { ... }` block inside `TRANSLATIONS`.
+2. Paste it right below `"en"`, change the key to your language code (for example `"ru"` or `"pt"`), and set `"_name"` to your language's native name (for example `"Русский"`).
+3. Translate the text values (keep `{placeholders}` like `{count}` or `{mm2}` unchanged) and open a Pull Request—the top-bar language selector detects new languages automatically and falls back to English for any missing keys.
+
+---
+
 ## Changelog
 
+- **v1.0.2:**
+  - **Community Translation Architecture & Language Selector:** Centralized all UI and rule strings into a top-level `TRANSLATIONS` dictionary with automatic English fallback (`tr()`) and an auto-populated top-bar language dropdown.
+  - **Variable Layer Height & Organic/Tree Support Conflict Guard:** Automatically suppresses Variable Layer Height recommendations when supports are enabled, adds a slicer-conflict guardrail if both are active, and displays an amber `⚠` warning on the manual bottom-fillets card so users don't combine VLH with Organic/Tree supports.
 - **v1.0.1:**
   - **Smooth Surface Finish Modifier (All Filaments):** Added a persistent cross-profile `Smooth` toggle supporting 14 filament families (`PLA`, `PLA+`, `Silk PLA`, `Matte/Wood/PHA`, `PVB`, `PETG/PCTG`, `CF/GF` composites, `ABS/ASA/HIPS`, `PC`, `PA/Nylon`, `TPU/TPE`, foaming `Aero`, and soluble `PVA/BVOH`), downward-only speed/acceleration clamping, `Inner/Outer/Inner` wall order, conditional scarf joint seams, and a beginner drying/calibration guide.
   - **Opt-In Bridge Support Fix & Active Support Detection:** Added an opt-in breakaway `Tree (Auto) · Organic` support fix for floating horizontal bridges (`>85°`) with material-tuned Top Z distance, and auto-clears the warning once supports are active.
@@ -153,7 +167,7 @@ The numbers inside **Mesh & Model Inspector** (dimensions, bed area, bottom fill
 
 ## Bugs, Feedback & Plugin Help
 
-Found a bug in the plugin, hit a weird `.3mf` parsing issue, or have an idea for a new check? Feel free to leave a comment on [Orca Cloud](https://cloud.orcaslicer.com/p/3b308f5ef16a) or open an issue on [GitHub Issues](https://github.com/FleeceFlames/Orca_Print_Advisor/issues) — I check in whenever I have some free time and will gladly take a look!
+Found a bug in the plugin, hit a weird `.3mf` parsing issue, or have an idea for a new check? Feel free to leave a comment on [Orca Cloud](https://cloud.orcaslicer.com/p/3b308f5ef16a) or open an issue on [GitHub Issues](https://github.com/FleeceFlames/Orca_Print_Advisor/issues) — just keep it related to the plugin itself. I check in whenever I have some free time and will gladly take a look!
 
 ---
 
